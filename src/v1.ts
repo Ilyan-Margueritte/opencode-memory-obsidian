@@ -308,15 +308,25 @@ async function consolidate(sessionID: string): Promise<void> {
     .map((m: any) => String(m?.id ?? m?.info?.id))
     .slice(-20)
 
-  const dream = consolidationModel(sessionID)
+  // Provider dispatch (T9): with "openai-compatible" the consolidation calls
+  // the configured chat/completions endpoint directly — no child session to
+  // create or delete. The default "opencode" path keeps the headless child
+  // model. A misconfigured provider yields no model — the round is skipped
+  // and memory stays fully usable (same contract as dreamOrganization).
+  const child = CONFIG.dreamProvider === "openai-compatible" ? undefined : consolidationModel(sessionID)
   try {
+    const model = child ? child.model : buildDreamModel(sessionID)
+    if (!model) {
+      log("warn", "consolidation skipped: dream model unavailable", { sessionID })
+      return
+    }
     // The shared engine owns the two-phase commit (guards, prompt, semantic
     // dedup, locked apply+prune+writeStore, commit), the secret guard and the
     // dedup fallbacks. A failed round leaves memory fully usable.
     const outcome = await runConsolidation(
       io,
       CONFIG,
-      dream.model,
+      model,
       { id: sessionID, directory: session.directory, title: session.title },
       { transcript, messageIDs, lastTs },
       log,
@@ -325,7 +335,8 @@ async function consolidate(sessionID: string): Promise<void> {
   } finally {
     // The helper child is deleted only after the consolidation settled, so
     // its deletion implies the store (and the session marker) are committed.
-    await dream.dispose()
+    // (Only the "opencode" path has a child session to dispose.)
+    await child?.dispose()
   }
 }
 
@@ -335,9 +346,9 @@ async function consolidate(sessionID: string): Promise<void> {
 // in the picker, but present). Both consolidation AND rerank children are
 // covered. A child is removed only when BOTH conditions hold: it is older
 // than gcChildAgeMs AND shows no recent activity (updated < cutoff) — a slow
-// but live helper must never be killed. Children referenced by a valid
-// (unexpired) inProgress marker are exempt even across processes (a second
-// server instance must not delete the child of a live one).
+// but live helper must never be killed. inProgress markers no longer carry a
+// childID (nothing writes it today), so children are protected by this
+// age+inactivity heuristic only.
 async function gcConsolidationChildren() {
   try {
     const state = await getState()
