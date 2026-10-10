@@ -38,6 +38,8 @@ test("every environment setting can be supplied through plugin options", () => {
     gcChildAgeMs: 0, inProgressTimeoutMs: 1, rerank: true,
     rerankCandidates: 1, rerankTimeoutMs: 1, rerankCacheMs: 0,
     coreSlot: 0, surfaceRefreshMs: 0,
+    dreamProvider: "openai-compatible" as const, dreamModel: "dream-model",
+    dreamBaseUrl: "http://127.0.0.1:9/v1", dreamApiKey: "dream-key", staleDays: 1,
   }
   expect(resolveConfig(options, {})).toEqual({ ...options, dir: resolve("/tmp/memory-all-options") })
 })
@@ -50,6 +52,39 @@ test("invalid options fail at setup with the offending name", () => {
   expect(() => resolveConfig({ rerankTimeoutMs: Infinity }, {})).toThrow("rerankTimeoutMs")
   expect(() => resolveConfig({ dir: "" }, {})).toThrow("dir")
   expect(() => resolveConfig({ dir: "relative/path" }, {})).toThrow("absolute")
+})
+
+test("dream provider options keep their defaults and read the environment", () => {
+  const defaults = resolveConfig({}, {})
+  expect(defaults.dreamProvider).toBe("opencode")
+  expect(defaults.dreamModel).toBeUndefined()
+  expect(defaults.dreamBaseUrl).toBeUndefined()
+  expect(defaults.dreamApiKey).toBeUndefined()
+  expect(defaults.staleDays).toBe(90)
+  const fromEnv = resolveConfig({}, {
+    OPENCODE_MEMORY_DREAM_PROVIDER: "openai-compatible",
+    OPENCODE_MEMORY_DREAM_BASE_URL: "http://127.0.0.1:9/v1",
+    OPENCODE_MEMORY_DREAM_MODEL: "dream-model",
+    OPENCODE_MEMORY_STALE_DAYS: "30",
+  })
+  expect(fromEnv.dreamProvider).toBe("openai-compatible")
+  expect(fromEnv.dreamBaseUrl).toBe("http://127.0.0.1:9/v1")
+  expect(fromEnv.dreamModel).toBe("dream-model")
+  expect(fromEnv.staleDays).toBe(30)
+})
+
+test("invalid dream provider options fail at setup with the offending name", () => {
+  expect(() => resolveConfig({ dreamProvider: "mistral" }, {})).toThrow("dreamProvider")
+  // The error must list the valid values for the enum.
+  expect(() => resolveConfig({ dreamProvider: "mistral" }, {})).toThrow("openai-compatible")
+  expect(() => resolveConfig({ dreamProvider: "" }, {})).toThrow("dreamProvider")
+  expect(() => resolveConfig({ dreamProvider: "openai-compatible" }, {})).toThrow("dreamBaseUrl")
+  expect(() => resolveConfig({ dreamProvider: "openai-compatible", dreamBaseUrl: "http://127.0.0.1:9/v1" }, {}))
+    .toThrow("dreamModel")
+  expect(() => resolveConfig({ dreamModel: "" }, {})).toThrow("dreamModel")
+  expect(() => resolveConfig({ dreamBaseUrl: "" }, {})).toThrow("dreamBaseUrl")
+  expect(() => resolveConfig({ dreamApiKey: "" }, {})).toThrow("dreamApiKey")
+  expect(() => resolveConfig({ staleDays: 0 }, {})).toThrow("staleDays")
 })
 
 test("summary is enabled by default and accepts a strict environment switch", () => {

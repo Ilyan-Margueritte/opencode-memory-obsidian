@@ -33,6 +33,11 @@ const OPTION_ENV = {
   rerankCacheMs: "OPENCODE_MEMORY_RERANK_CACHE_MS",
   coreSlot: "OPENCODE_MEMORY_CORE_SLOT",
   surfaceRefreshMs: "OPENCODE_MEMORY_SURFACE_REFRESH_MS",
+  dreamProvider: "OPENCODE_MEMORY_DREAM_PROVIDER",
+  dreamModel: "OPENCODE_MEMORY_DREAM_MODEL",
+  dreamBaseUrl: "OPENCODE_MEMORY_DREAM_BASE_URL",
+  dreamApiKey: "OPENCODE_MEMORY_DREAM_API_KEY",
+  staleDays: "OPENCODE_MEMORY_STALE_DAYS",
 } as const
 
 export type MemoryConfig = {
@@ -58,6 +63,18 @@ export type MemoryConfig = {
   rerankCacheMs: number
   coreSlot: number
   surfaceRefreshMs: number
+  // Dream model provider (see src/dream/provider.ts): "opencode" keeps using
+  // the local OpenCode session model; "openai-compatible" calls any
+  // chat/completions endpoint directly. Memory stays readable when the model
+  // is unavailable — the provider may throw, the caller decides.
+  dreamProvider: "opencode" | "openai-compatible"
+  dreamModel?: string
+  dreamBaseUrl?: string
+  // Secret: resolved for the provider but never logged, never quoted in an
+  // error message.
+  dreamApiKey?: string
+  // Facts untouched for longer than this many days count as stale candidates.
+  staleDays: number
 }
 
 export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = process.env): MemoryConfig {
@@ -104,6 +121,35 @@ export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS
     throw new Error("opencode-memory dir option must be an absolute path")
   }
 
+  const DREAM_PROVIDERS = ["opencode", "openai-compatible"] as const
+
+  // Optional string option: rejected when set to anything but a nonempty
+  // string. The VALUE is never echoed back (dreamApiKey is secret).
+  function optionalString(key: keyof typeof OPTION_ENV): string | undefined {
+    const value = raw(key)
+    if (value === undefined) return undefined
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new Error(`opencode-memory ${key} must be a nonempty string when set`)
+    }
+    return value
+  }
+
+  const dreamProviderRaw = optionalString("dreamProvider") ?? DREAM_PROVIDERS[0]
+  if (!(DREAM_PROVIDERS as readonly string[]).includes(dreamProviderRaw)) {
+    throw new Error(`opencode-memory dreamProvider must be one of: ${DREAM_PROVIDERS.map((value) => JSON.stringify(value)).join(", ")}`)
+  }
+  const dreamModel = optionalString("dreamModel")
+  const dreamBaseUrl = optionalString("dreamBaseUrl")
+  const dreamApiKey = optionalString("dreamApiKey")
+  if (dreamProviderRaw === "openai-compatible") {
+    if (dreamBaseUrl === undefined) {
+      throw new Error(`opencode-memory dreamBaseUrl must be set when dreamProvider is "openai-compatible"`)
+    }
+    if (dreamModel === undefined) {
+      throw new Error(`opencode-memory dreamModel must be set when dreamProvider is "openai-compatible"`)
+    }
+  }
+
   return {
     off: boolean("off", false),
     dream: boolean("dream", true),
@@ -127,6 +173,11 @@ export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS
     rerankCacheMs: integer("rerankCacheMs", 60 * 1000, 0),
     coreSlot: integer("coreSlot", 3, 0),
     surfaceRefreshMs: integer("surfaceRefreshMs", 15 * 60 * 1000, 0),
+    dreamProvider: dreamProviderRaw as (typeof DREAM_PROVIDERS)[number],
+    dreamModel,
+    dreamBaseUrl,
+    dreamApiKey,
+    staleDays: integer("staleDays", 90, 1),
   }
 }
 
