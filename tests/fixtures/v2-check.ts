@@ -1,6 +1,8 @@
 // @ts-nocheck
-import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { mkdir, writeFile } from "node:fs/promises"
+import { join } from "node:path"
 import plugin from "../../src/index.ts"
+import { createStore } from "../../src/store.ts"
 
 const directory = process.cwd()
 const sessionID = "v2-session"
@@ -97,8 +99,10 @@ if (plugin.id !== "cioffi.opencode-memory" || typeof plugin.setup !== "function"
 }
 
 if (sweepOnly) {
-  await mkdir(process.env.OPENCODE_MEMORY_DIR, { recursive: true })
-  await writeFile(`${process.env.OPENCODE_MEMORY_DIR}/state.json`, JSON.stringify({
+  // The state file lives in .memory/ of the vault layout.
+  const memoryDir = process.env.OPENCODE_MEMORY_DIR
+  await mkdir(join(memoryDir, ".memory"), { recursive: true })
+  await writeFile(join(memoryDir, ".memory", "state.json"), JSON.stringify({
     sessions: {},
     inProgress: {
       [sessionID]: { targetTs: 103, startedAt: 0 },
@@ -122,23 +126,17 @@ const cleanup = await plugin.setup(ctx)
 if (tools.length !== 9) throw new Error(`expected 9 V2 tools, got ${tools.length}`)
 if (surfaceDisabled === Boolean(hooks.context)) throw new Error("SURFACE hook registration does not match configuration")
 
-const storePath = `${process.env.OPENCODE_MEMORY_DIR}/store.json`
+const io = createStore(process.env.OPENCODE_MEMORY_DIR)
 let store
 if (dreamDisabled) {
   await Bun.sleep(30)
   if (generateCalls !== 0) throw new Error("DREAM generated text while disabled")
-  try {
-    store = JSON.parse(await readFile(storePath, "utf8"))
-    if (store.entries.some((entry) => entry.source === "dreamed")) throw new Error("DREAM wrote a fact while disabled")
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error
-  }
+  store = await io.getStore()
+  if (store.entries.some((entry) => entry.source === "dreamed")) throw new Error("DREAM wrote a fact while disabled")
 } else {
   for (let attempt = 0; attempt < 100; attempt++) {
-    try {
-      store = JSON.parse(await readFile(storePath, "utf8"))
-      if (store.entries.some((entry) => entry.source === "dreamed")) break
-    } catch {}
+    store = await io.getStore()
+    if (store.entries.some((entry) => entry.source === "dreamed")) break
     await Bun.sleep(10)
   }
   if (!store?.entries.some((entry) => entry.source === "dreamed" && entry.sourceSessionID === sessionID)) {

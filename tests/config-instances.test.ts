@@ -1,12 +1,14 @@
 // @ts-nocheck — focused fake contexts for both OpenCode adapter shapes.
 import { expect, test } from "bun:test"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "../src/index.ts"
+import { createStore } from "../src/store.ts"
 
-function entries(dir: string) {
-  return JSON.parse(readFileSync(join(dir, "store.json"), "utf8")).entries
+// The store is markdown-backed: read it back through the store layer.
+async function entries(dir: string) {
+  return (await createStore(dir).getStore()).entries
 }
 
 test("V1 keeps opencode.jsonc options and store paths separate per instance", async () => {
@@ -24,8 +26,8 @@ test("V1 keeps opencode.jsonc options and store paths separate per instance", as
     const second = await plugin.server({ client }, { dir: b, dream: false, surface: true })
     await first.tool.memory_write.execute({ fact: "Project A prefers tea.", category: "preferences" }, { directory: "/project-a" })
     await second.tool.memory_write.execute({ fact: "Project B prefers coffee.", category: "preferences" }, { directory: "/project-b" })
-    expect(entries(a).map((entry) => entry.text)).toEqual(["Project A prefers tea."])
-    expect(entries(b).map((entry) => entry.text)).toEqual(["Project B prefers coffee."])
+    expect((await entries(a)).map((entry) => entry.text)).toEqual(["Project A prefers tea."])
+    expect((await entries(b)).map((entry) => entry.text)).toEqual(["Project B prefers coffee."])
     const blocked = { system: [] }
     const enabled = { system: [] }
     await first["experimental.chat.system.transform"]({ sessionID: "a" }, blocked)
@@ -74,8 +76,8 @@ test("V2 keeps opencode.jsonc options and store paths separate per instance", as
     const toolContext = { sessionID: "session", signal: new AbortController().signal, progress: async () => {} }
     await a.tools.find((tool) => tool.name === "memory_write").execute({ fact: "Project A prefers tea.", category: "preferences" }, toolContext)
     await b.tools.find((tool) => tool.name === "memory_write").execute({ fact: "Project B prefers coffee.", category: "preferences" }, toolContext)
-    expect(entries(join(root, "a")).map((entry) => entry.text)).toEqual(["Project A prefers tea."])
-    expect(entries(join(root, "b")).map((entry) => entry.text)).toEqual(["Project B prefers coffee."])
+    expect((await entries(join(root, "a"))).map((entry) => entry.text)).toEqual(["Project A prefers tea."])
+    expect((await entries(join(root, "b"))).map((entry) => entry.text)).toEqual(["Project B prefers coffee."])
     expect(a.hooks.context).toBeUndefined()
     const event = { sessionID: "session", system: [] }
     await b.hooks.context(event)

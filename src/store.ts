@@ -1,119 +1,67 @@
-// Store I/O: atomic writes, cross-instance lockfile, always-fresh reads.
-// Split out of index.ts so persistence concerns have a single boundary; the
-// consolidation and tool paths all go through these helpers.
+// Store I/O boundary: every persistence read/write goes through the
+// Obsidian-style markdown vault (src/vault). createStore keeps its historical
+// signature and StoreIO shape — the adapters and tools are unchanged — but it
+// delegates to the vault, and a legacy JSON store (store.json + state.json +
+// SUMMARY.md at the root of the directory) is migrated automatically on first
+// use, once per directory AND per process (module-level Map of promises so
+// concurrent first calls share one migration; a failed attempt is dropped so
+// the next call can retry after a repair).
+//
+// Like before, getStore/writeStore do not lock themselves: callers wrap
+// multi-step mutations in withLock. The lockfile moved with the vault
+// (<dir>/.memory/.lock) and is shared across instances of the same directory.
+// The one-shot conversion itself (backup, notes, state, legacy moves) lives
+// in src/vault/migrate.ts; scripts/migrate-vault.ts documents the rollback.
 
-import { mkdir, open, readFile, rename, unlink, writeFile } from "fs/promises"
 import path from "path"
 import { resolveConfig } from "./config.ts"
-import { emptyStore, normalizeStore, type Store } from "./core.ts"
+import type { Store } from "./core.ts"
+import { migrateLegacyJson } from "./vault/migrate.ts"
+import { createVaultStore, type State } from "./vault/vaultStore.ts"
 
-function now() {
-  return Date.now()
+export type { InProgress, State } from "./vault/vaultStore.ts"
+
+const migrations = new Map<string, Promise<void>>()
+
+function migrateOnce(dataDir: string): Promise<void> {
+  const existing = migrations.get(dataDir)
+  if (existing) return existing
+  const pending = migrateLegacyJson(dataDir).then(
+    () => undefined,
+    (error) => {
+      migrations.delete(dataDir)
+      throw error
+    },
+  )
+  migrations.set(dataDir, pending)
+  return pending
 }
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms))
-}
-
-async function readJson<T>(file: string, fallback: T): Promise<T> {
-  try {
-    return JSON.parse(await readFile(file, "utf8")) as T
-  } catch {
-    return fallback
-  }
-}
-
-async function writeJson(file: string, value: unknown) {
-  await mkdir(path.dirname(file), { recursive: true }).catch(() => {})
-  const tmp = `${file}.tmp`
-  await writeFile(tmp, JSON.stringify(value, null, 2), "utf8")
-  await rename(tmp, file)
-}
-
-// Always read the store fresh from disk: the consolidation writes it inside
-// its own lock, and a stale in-memory copy would make the consolidation
-// prompt and the dedup guard see outdated entries (or none at all).
-// No lock needed on read: writeJson uses an atomic rename, so we always see
-// a complete file (old or new version). This also avoids nested locks inside
-// the critical sections that call getStore() themselves.
-export type InProgress = {
-  targetTs: number
-  startedAt: number
-  childID?: string
-}
-
-export type State = {
-  sessions: Record<string, number>
-  inProgress?: Record<string, InProgress>
-}
-
-// Share a queue across instances using the same directory. The filesystem
-// lock still protects against other processes; local callers wait their turn
-// without consuming the cross-process lock timeout.
-const lockQueues = new Map<string, Promise<void>>()
 
 export function createStore(dataDir: string) {
   dataDir = path.resolve(dataDir)
-  const lockFile = path.join(dataDir, ".lock")
-  const storeFile = path.join(dataDir, "store.json")
-  const stateFile = path.join(dataDir, "state.json")
-  const summaryFile = path.join(dataDir, "SUMMARY.md")
-
-  async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = lockQueues.get(lockFile) ?? Promise.resolve()
-    let release!: () => void
-    const turn = new Promise<void>((resolve) => { release = resolve })
-    lockQueues.set(lockFile, turn)
-    await previous
-    try {
-      await mkdir(dataDir, { recursive: true }).catch(() => {})
-      let fd: Awaited<ReturnType<typeof open>> | undefined
-      for (let i = 0; i < 40; i++) {
-        try {
-          fd = await open(lockFile, "wx")
-          break
-        } catch {
-          await sleep(50)
-        }
-      }
-      if (!fd) throw new Error("memory store lock timeout")
-      try {
-        return await fn()
-      } finally {
-        await fd.close().catch(() => {})
-        await unlink(lockFile).catch(() => {})
-      }
-    } finally {
-      release()
-      if (lockQueues.get(lockFile) === turn) lockQueues.delete(lockFile)
-    }
+  const vault = createVaultStore(dataDir)
+  return {
+    async withLock<T>(fn: () => Promise<T>): Promise<T> {
+      await migrateOnce(dataDir)
+      return vault.withLock(fn)
+    },
+    async getStore() {
+      await migrateOnce(dataDir)
+      return vault.getStore()
+    },
+    async writeStore(store: Store) {
+      await migrateOnce(dataDir)
+      await vault.writeStore(store)
+    },
+    async getState() {
+      await migrateOnce(dataDir)
+      return vault.getState()
+    },
+    async saveState(state: State) {
+      await migrateOnce(dataDir)
+      await vault.saveState(state)
+    },
   }
-
-  async function getStore(): Promise<Store> {
-    return normalizeStore(await readJson<Store>(storeFile, emptyStore()))
-  }
-
-  async function writeStore(store: Store) {
-    await writeJson(storeFile, store)
-    await writeFile(
-      summaryFile,
-      `# opencode memory summary\n\nUpdated: ${new Date(store.updatedAt).toISOString()}\n\n${store.summary || "_No summary yet — it is generated after the first consolidation._"}\n`,
-      "utf8",
-    )
-  }
-
-  async function getState(): Promise<State> {
-    const state = await withLock(() => readJson<State>(stateFile, { sessions: {}, inProgress: {} }))
-    state.sessions = state.sessions ?? {}
-    state.inProgress = state.inProgress ?? {}
-    return state
-  }
-
-  async function saveState(state: State) {
-    await withLock(() => writeJson(stateFile, state))
-  }
-
-  return { withLock, getStore, writeStore, getState, saveState }
 }
 
 export type StoreIO = ReturnType<typeof createStore>

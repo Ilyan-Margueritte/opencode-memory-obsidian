@@ -109,11 +109,27 @@ export function createVaultStore(dataDir: string): VaultIO {
     }
   }
 
+  // Unique tmp name: bare getStore() persists the index without taking the
+  // lock, so concurrent readers/writers must never share one tmp file (two
+  // writers on the same fixed name made the second rename fail with ENOENT).
+  let tmpSeq = 0
   async function atomicWrite(file: string, content: string) {
     await mkdir(path.dirname(file), { recursive: true }).catch(() => {})
-    const tmp = `${file}.tmp`
+    const tmp = `${file}.${process.pid}.${++tmpSeq}.tmp`
     await writeFile(tmp, content, "utf8")
-    await rename(tmp, file)
+    // Windows: the destination can be momentarily held open by a concurrent
+    // reader (bare getStore re-reads index.json/state.json), which surfaces
+    // as an EPERM sharing violation on rename. A bounded retry turns that
+    // transient case into "last writer wins" without weakening atomicity.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await rename(tmp, file)
+        return
+      } catch (error) {
+        if (attempt >= 19 || !existsSync(tmp)) throw error
+        await sleep(25)
+      }
+    }
   }
 
   async function writeJson(file: string, value: unknown) {

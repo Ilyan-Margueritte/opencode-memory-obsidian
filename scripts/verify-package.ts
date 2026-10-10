@@ -53,11 +53,41 @@ function step(message: string) {
 // resolves both runtime SDKs inside the install dir), exercises the V1
 // server() adapter and the V2 setup() adapter, then disposes both.
 const CHECK_SCRIPT = `
- import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
  import plugin from "${PKG_NAME}"
  import serverPlugin from "${PKG_NAME}/server"
 
 const EXPECTED = ${JSON.stringify(EXPECTED_TOOLS)}
+// The store is markdown-backed: entries live in notes under Global/ and
+// Projects/ (one memory = one note, id in the frontmatter, text as body).
+function noteBody(raw) {
+  const end = raw.indexOf("\\n---", 4)
+  const start = end === -1 ? 0 : raw.indexOf("\\n\\n", end)
+  return start === -1 ? "" : raw.slice(start).trim()
+}
+function readVaultEntries(dir) {
+  const out = []
+  const scan = (sub) => {
+    let dirents
+    try { dirents = readdirSync(sub, { withFileTypes: true }) } catch { return }
+    for (const d of dirents) {
+      const p = sub + "/" + d.name
+      if (d.isDirectory()) scan(p)
+      else if (d.isFile() && d.name.toLowerCase().endsWith(".md")) {
+        const raw = readFileSync(p, "utf8")
+        out.push({ id: /id: "([^"]+)"/.exec(raw)?.[1], text: noteBody(raw), raw })
+      }
+    }
+  }
+  scan(dir + "/Global")
+  scan(dir + "/Projects")
+  return out
+}
+function summaryBody(dir) {
+  let raw
+  try { raw = readFileSync(dir + "/SUMMARY.md", "utf8") } catch { return "" }
+  return noteBody(raw)
+}
 const manifest = JSON.parse(readFileSync("node_modules/${PKG_NAME}/package.json", "utf8"))
 if (!manifest.dependencies?.["@opencode-ai/plugin"]) {
   console.error("FAIL: installed package does not declare @opencode-ai/plugin in dependencies")
@@ -118,7 +148,7 @@ console.log("OK V1: " + actual.length + " tools registered, dispose() completed"
 const configuredDir = memoryDir + "/v1-configured"
 const configuredV1 = await plugin.server({ client }, { dir: configuredDir, dream: false, surface: false, summary: false })
 await configuredV1.tool.memory_write.execute({ fact: "Configured V1 store." }, { directory: process.cwd() })
-const configuredEntries = JSON.parse(readFileSync(configuredDir + "/store.json", "utf8")).entries
+const configuredEntries = readVaultEntries(configuredDir)
 if (configuredEntries.length !== 1 || configuredEntries[0].text !== "Configured V1 store.") {
   console.error("FAIL: installed V1 adapter ignored plugin options")
   process.exit(1)
@@ -135,15 +165,14 @@ async function verifyControls(call, dir) {
     "The user prefers concise responses.",
   ]
   await Promise.all(facts.map((fact) => call("memory_write", { fact, category: "preferences" })))
-  const path = dir + "/store.json"
-  const saved = JSON.parse(readFileSync(path, "utf8"))
-  if (facts.some((fact) => !saved.entries.some((entry) => entry.text === fact))) throw new Error("packed adapter lost a parallel write")
-  saved.summary = "PACKED_STALE_SUMMARY"
-  writeFileSync(path, JSON.stringify(saved))
-  if (String(await call("memory_read", {})).includes(saved.summary)) throw new Error("packed adapter exposed disabled summary")
+  const saved = readVaultEntries(dir)
+  if (facts.some((fact) => !saved.some((entry) => entry.text === fact))) throw new Error("packed adapter lost a parallel write")
+  // The summary lives in SUMMARY.md now: inject a stale one through the file.
+  writeFileSync(dir + "/SUMMARY.md", "---\\ntype: \\"summary\\"\\nupdated: \\"" + new Date().toISOString() + "\\"\\n---\\n\\nPACKED_STALE_SUMMARY\\n")
+  if (String(await call("memory_read", {})).includes("PACKED_STALE_SUMMARY")) throw new Error("packed adapter exposed disabled summary")
   await call("memory_clear", { summaryOnly: true })
-  const cleared = JSON.parse(readFileSync(path, "utf8"))
-  if (cleared.summary !== "" || cleared.entries.length !== saved.entries.length) throw new Error("packed summary-only clear lost facts")
+  const cleared = readVaultEntries(dir)
+  if (summaryBody(dir) !== "" || cleared.length !== saved.length) throw new Error("packed summary-only clear lost facts")
 }
 await verifyControls(async (name, args) => configuredV1.tool[name].execute(args, { directory: process.cwd() }), configuredDir)
 await configuredV1.dispose()
@@ -203,8 +232,9 @@ if (!String(result.content).includes("coffee in the morning")) {
   process.exit(1)
 }
 await verifyControls(async (name, args) => (await v2Tools.find((tool) => tool.name === name).execute(args, toolContext)).content, memoryDir)
-const migrated = JSON.parse(readFileSync(memoryDir + "/store.json", "utf8"))
-if (migrated.version !== 2 || migrated.entries.find((entry) => entry.id === "legacy-1")?.tier !== "core") {
+const migrated = readVaultEntries(memoryDir)
+const legacy = migrated.find((entry) => entry.id === "legacy-1")
+if (!legacy || !legacy.raw.includes('tier: "core"')) {
   console.error("FAIL: installed package did not migrate the V1 store to V2")
   process.exit(1)
 }

@@ -1,6 +1,7 @@
 // @ts-nocheck
-import { mkdir, readFile } from "node:fs/promises"
+import { mkdir } from "node:fs/promises"
 import plugin from "../../src/index.ts"
+import { createStore } from "../../src/store.ts"
 
 const dreamDisabled = process.env.V1_CHECK_DREAM_DISABLED === "1"
 const surfaceDisabled = process.env.V1_CHECK_SURFACE_DISABLED === "1"
@@ -39,7 +40,7 @@ if (surfaceDisabled) {
   throw new Error("V1 SURFACE did not inject the explicit memory")
 }
 
-const store = JSON.parse(await readFile(`${memoryDir}/store.json`, "utf8"))
+const store = await createStore(memoryDir).getStore()
 if (store.entries.length !== 1 || store.entries[0].source !== "explicit") throw new Error("explicit write was lost")
 await hooks.dispose()
 console.log("V1_FLAGS_OK")

@@ -25,6 +25,7 @@ import { describe, expect, test } from "bun:test"
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { createStore } from "../src/store.ts"
 
 const E2E_URL = process.env.OPENCODE_MEMORY_E2E_URL
 const E2E_MEMORY_DIR = process.env.OPENCODE_MEMORY_DIR ?? join(homedir(), ".local", "share", "opencode", "memory")
@@ -52,14 +53,20 @@ describe("e2e (live server)", () => {
 
   test.skipIf(!!skip)("persists a memory store and a state file on disk", async () => {
 
-    const storePath = join(E2E_MEMORY_DIR, "store.json")
-    const statePath = join(E2E_MEMORY_DIR, "state.json")
+    // The store is markdown-backed: notes + SUMMARY.md under the memory dir,
+    // state in .memory/state.json. Wait for the vault to be written, then
+    // read the store through the store layer itself.
+    const statePath = join(E2E_MEMORY_DIR, ".memory", "state.json")
+    const io = createStore(E2E_MEMORY_DIR)
 
-    for (let i = 0; i < 30 && !existsSync(storePath); i++) {
+    for (let i = 0; i < 30; i++) {
+      const store = await io.getStore()
+      if (store.entries.length > 0 || existsSync(statePath)) break
       await Bun.sleep(2000)
     }
 
-    expect(existsSync(storePath)).toBe(true)
+    const store = await io.getStore()
+    expect(Array.isArray(store.entries)).toBe(true)
     expect(existsSync(statePath)).toBe(true)
   }, 90_000)
 })
