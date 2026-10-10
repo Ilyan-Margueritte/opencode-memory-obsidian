@@ -2,6 +2,8 @@
 // it can be unit-tested directly. The plugin entrypoint (index.ts) imports
 // from here; nothing of this module is re-exported from the entrypoint.
 
+import { findSecret } from "./memory/redaction.ts"
+
 export type Entry = {
   id: string
   text: string
@@ -526,6 +528,13 @@ export function applyConsolidation(
   for (const item of parsed.new ?? []) {
     if (!item || typeof item.text !== "string" || !item.text.trim()) continue
     const text = item.text.trim()
+    // Secret guard (redaction): a Dream-extracted fact that looks like a
+    // credential is ignored entirely — never partially redacted, never stored.
+    const secret = findSecret(text)
+    if (secret) {
+      log?.("warn", "dream fact skipped: potential secret", { label: secret })
+      continue
+    }
     const scope: Entry["scope"] = item.scope === "project" ? "project" : "global"
     const category = typeof item.category === "string" && CATEGORIES.includes(item.category) ? item.category : "other"
     const existing = findSimilar(visible(), text, 0.5)
@@ -576,6 +585,11 @@ export function applyConsolidation(
   }
   for (const item of parsed.update ?? []) {
     if (!item || typeof item.text !== "string" || !item.text.trim()) continue
+    const secret = findSecret(item.text.trim())
+    if (secret) {
+      log?.("warn", "dream fact skipped: potential secret", { label: secret })
+      continue
+    }
     const target = item.id
       ? visible().find((e) => e.id === item.id)
       : item.match
