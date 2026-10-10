@@ -1,14 +1,5 @@
 import type { Plugin } from "@opencode/plugin"
-import {
-  applyConsolidation,
-  applyRerankOrderAnswer,
-  consolidationEntries,
-  extractJson,
-  parseRerankAnswer,
-  prune,
-  type Entry,
-  type RankedMemory,
-} from "./core.ts"
+import { applyRerankOrderAnswer, parseRerankAnswer, type RankedMemory } from "./core.ts"
 import { resolveConfig, type MemoryConfig } from "./config.ts"
 import { createStore, type StoreIO } from "./store.ts"
 import {
@@ -24,6 +15,9 @@ import {
   type ToolContext,
 } from "./memory/api.ts"
 import { buildMemoryBlock as buildSurfaceBlock } from "./memory/surface.ts"
+import { runConsolidation, runDreamOrganization } from "./dream/dream.ts"
+import { createOpenAICompatibleModel, dreamProviderConfig, type DreamModel } from "./dream/provider.ts"
+import { vaultPaths } from "./vault/paths.ts"
 
 type LogLevel = "debug" | "info" | "warn" | "error"
 type SessionInfo = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
@@ -227,7 +221,19 @@ class V2MemoryRuntime {
         .sort(([, left], [, right]) => right.targetTs - left.targetTs)
         .slice(0, this.config.sweepBatch)
       for (const [sessionID] of candidates) this.enqueue(sessionID)
-      if (candidates.length > 0) this.log("debug", "recovery sweep queued", { count: candidates.length })
+      if (candidates.length > 0) {
+        this.log("debug", "recovery sweep queued", { count: candidates.length })
+        // Organization runs after the queued consolidations settled (never
+        // concurrently with them) and after the recovery sweep itself.
+        // Enrichment uses the default model here: generate.text needs no
+        // parent session.
+        try {
+          await this.pumpTask
+          await this.organization()
+        } catch (error) {
+          this.log("warn", "dream organization failed", { error: String(error) })
+        }
+      }
     } catch (error) {
       this.log("warn", "recovery sweep failed", { error: String(error) })
     }
@@ -264,10 +270,41 @@ class V2MemoryRuntime {
     return session?.location.directory ?? this.ctx.location.directory
   }
 
-  // V2's top-level generate API is intentionally used for all internal model
-  // work. Its documented contract creates no session, invokes no tools and
-  // writes no history, so DREAM/rerank cannot gain filesystem or network
-  // capabilities and leave no helper sessions to delete.
+  // The Dream model: each adapter wraps its own runtime behind the injectable
+  // DreamModel interface. V2's top-level generate API is intentionally used
+  // for all internal model work. Its documented contract creates no session,
+  // invokes no tools and writes no history, so DREAM/rerank cannot gain
+  // filesystem or network capabilities and leave no helper sessions to delete.
+  // Provider dispatch (T9): "openai-compatible" calls the configured endpoint
+  // directly; "opencode" keeps the native path. May throw on a misconfigured
+  // provider — the caller decides how to degrade.
+  private dreamModel(session?: SessionInfo): DreamModel {
+    if (this.config.dreamProvider === "openai-compatible") {
+      const provider = dreamProviderConfig(this.config)
+      if (provider.kind !== "openai-compatible") throw new Error("opencode-memory dream provider is not openai-compatible")
+      return createOpenAICompatibleModel(provider)
+    }
+    return { complete: ({ prompt, timeoutMs }) => this.generate(prompt, session, timeoutMs) }
+  }
+
+  // Organization phase (duplicates, knowledge sync, enrichment, staleness
+  // proposals) — fired after a committed consolidation and after the recovery
+  // sweep. All failures are logged and never break the consolidation round.
+  private async organization(session?: SessionInfo): Promise<void> {
+    try {
+      const model = this.dreamModel(session)
+      const report = await runDreamOrganization(this.store, this.config, vaultPaths(this.config.dir), model, this.log.bind(this))
+      this.log("info", "dream organization", {
+        duplicatesArchived: report.duplicatesArchived,
+        staleProposed: report.staleProposed,
+        knowledgeUpdated: report.knowledgeUpdated.length,
+        enriched: report.enriched,
+      })
+    } catch (error) {
+      this.log("warn", "dream organization failed", { error: String(error) })
+    }
+  }
+
   private async generate(prompt: string, session?: SessionInfo, timeoutMs = 120_000): Promise<string> {
     const request = session?.model ? { prompt, model: session.model } : { prompt }
     const controller = new AbortController()
@@ -286,134 +323,36 @@ class V2MemoryRuntime {
     }
   }
 
-  private async dedupCheck(
-    session: SessionInfo,
-    entries: Entry[],
-    candidates: { text: string }[],
-  ): Promise<Set<number>> {
-    const skip = new Set<number>()
-    if (candidates.length === 0 || entries.length === 0) return skip
-    const entryLines = entries.map((entry) => `${entry.id} | ${entry.source} | ${entry.category} | ${entry.text}`).join("\n")
-    const candidateLines = candidates.map((candidate, index) => `[${index}] ${candidate.text}`).join("\n")
-    const prompt = `You are a deduplication checker for a memory store.
-
-EXISTING MEMORY ENTRIES:
-${entryLines}
-
-CANDIDATE NEW FACTS:
-${candidateLines}
-
-For each candidate that is semantically equivalent to an existing entry (same meaning, ANY language, paraphrase), reply with that candidate's index in "duplicates". An entry with source=explicit always wins over a candidate. Candidates that describe something NEW are not duplicates.
-
-REPLY WITH STRICT JSON ONLY:
-{"duplicates":[0,2]}`
-    try {
-      const answer = await this.generate(prompt, session, 90_000)
-      const parsed = extractJson(answer)
-      const duplicates = Array.isArray(parsed?.duplicates) ? parsed.duplicates : []
-      for (const duplicate of duplicates) {
-        const index = Number(duplicate)
-        if (Number.isInteger(index) && index >= 0 && index < candidates.length) skip.add(index)
-      }
-    } catch (error) {
-      this.log("debug", "dedup check failed", { error: String(error) })
-    }
-    return skip
-  }
-
   private async consolidate(sessionID: string) {
     const session = await this.sessionInfo(sessionID)
     if (!session) return
     const messages = await this.ctx.session.context({ sessionID })
     const lastTs = messages.reduce((max, message) => Math.max(max, messageTimestamp(message)), 0)
-    const state = await this.store.getState()
-    if (lastTs <= (state.sessions[sessionID] ?? 0)) return
-
-    const inProgress = state.inProgress?.[sessionID]
-    if (inProgress && now() - inProgress.startedAt < this.config.inProgressTimeoutMs) return
-
     const transcript = messages
       .map((message) => `${message.type}: ${messageText(message)}`)
       .join("\n\n")
       .slice(-this.config.transcriptChars)
     const messageIDs = messages.map((message) => String(message.id)).slice(-20)
-    const directory = session.location.directory
-    const store = await this.store.getStore()
-    const visible = consolidationEntries(store, directory)
-    const entriesBlock =
-      visible.length === 0
-        ? "(none)"
-        : visible
-            .map((entry) => `- [${entry.id}] (${entry.scope}/${entry.category}, w=${entry.weight.toFixed(1)}, source=${entry.source}) ${entry.text}`)
-            .join("\n")
 
-    const prompt = `You are the memory consolidation module of OpenCode. You silently read a finished conversation and update the long-term memory store.
-
-TASKS:
-1. new: facts about the user (preferences, constraints, personal details, decisions, project state) that are NOT already in memory. Be concise, third person ("The user...").
-2. update: only entries whose fact genuinely CHANGED in the conversation. Never use update for mere reformulation.
-3. delete: ids of entries that are outdated or contradicted.
-4. conflicts: if the conversation STRONGLY contradicts an entry tagged source=explicit, report it with the entry id and a short evidence quote. Never modify or delete that entry.
-${this.config.summary ? "5. summary: 2-5 sentence summary of who the user is and how they like to work. NEVER include sensitive data in the summary." : ""}
-
-SOURCE HIERARCHY:
-- Entries tagged source=explicit were stated directly by the user and ALWAYS win over source=dreamed entries.
-- NEVER add a new fact semantically equivalent to an explicit entry, in any language or wording.
-- A fact about the same user attribute/topic is a duplicate unless it describes a different attribute.
-- NEVER delete or update explicit entries; use conflicts instead.
-- If a new fact duplicates a dreamed entry, delete the old dreamed id and add the better formulation.
-- If a dreamed entry contradicts an explicit one, delete the dreamed entry.
-
-RULES:
-- Do NOT invent facts; extract only what the conversation actually says.
-- Skip trivial small talk and one-off actions.
-- If nothing is new, return empty arrays${this.config.summary ? ' but still a summary (or "" if unchanged)' : ''}.
-- Write facts in the same language the user used.
-- Compare meaning across languages before adding a fact.
-- Use scope "project" only for facts tied to this codebase; otherwise use "global".
-- Optionally attach confidence (0-1) to each new fact.
-
-RESPOND WITH STRICT JSON ONLY:
-{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project","confidence":0.9}],"update":[{"id":"...","text":"..."}],"delete":["..."],"conflicts":[{"id":"...","evidence":"..."}]${this.config.summary ? ',"summary":"..."' : ''}}
-
-CURRENT MEMORY ENTRIES:
-${entriesBlock}
-
-TRANSCRIPT (session title: ${session.title ?? ""}):
-${transcript}`
-
-    state.inProgress![sessionID] = { targetTs: lastTs, startedAt: now() }
-    await this.store.saveState(state)
-    let completed = false
+    let model: DreamModel
     try {
-      const answer = await this.generate(prompt, session)
-      if (!answer) throw new Error("consolidation timed out")
-      const parsed = extractJson(answer)
-      if (!parsed || !Array.isArray(parsed.new)) throw new Error("consolidation returned no usable JSON")
-      if (!this.config.summary) delete parsed.summary
-
-      if (parsed.new.length > 0 && visible.length > 0) {
-        const skip = await this.dedupCheck(session, visible, parsed.new)
-        parsed.new = parsed.new.filter((_: unknown, index: number) => !skip.has(index))
-      }
-
-      await this.store.withLock(async () => {
-        const fresh = await this.store.getStore()
-        applyConsolidation(fresh, parsed, directory, now(), this.log.bind(this), {
-          sessionID,
-          messageIDs,
-        })
-        prune(fresh, now(), this.config.maxEntries)
-        await this.store.writeStore(fresh)
-      })
-      state.sessions[sessionID] = lastTs
-      completed = true
-      this.log("info", "consolidated session", { sessionID, newFacts: parsed.new.length })
-    } finally {
-      if (completed) delete state.inProgress![sessionID]
-      else state.inProgress![sessionID] = { targetTs: lastTs, startedAt: now() }
-      await this.store.saveState(state).catch(() => {})
+      model = this.dreamModel(session)
+    } catch (error) {
+      this.log("warn", "consolidation skipped: dream model unavailable", { sessionID, error: String(error) })
+      return
     }
+    // The shared engine owns the two-phase commit (guards, canonical prompt,
+    // semantic dedup, locked apply+prune+writeStore, commit), the secret
+    // guard and the dedup fallbacks. A failed round leaves memory usable.
+    const outcome = await runConsolidation(
+      this.store,
+      this.config,
+      model,
+      { id: sessionID, directory: session.location.directory, title: session.title },
+      { transcript, messageIDs, lastTs },
+      this.log.bind(this),
+    )
+    if (outcome === "committed") void this.organization(session)
   }
 
   private async sessionTopicQuery(sessionID: string): Promise<string> {

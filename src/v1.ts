@@ -1,12 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
-import {
-  applyConsolidation,
-  consolidationEntries,
-  extractJson,
-  prune,
-  type Entry,
-  type RankedMemory,
-} from "./core.ts"
+import type { RankedMemory } from "./core.ts"
 import { CONSOLIDATION_TITLE, RERANK_TITLE, SESSION_TOOLS_DENY_ALL, resolveConfig, type MemoryConfig } from "./config.ts"
 import { rerankCandidates } from "./rerank.ts"
 import { createStore } from "./store.ts"
@@ -23,13 +16,16 @@ import {
   type ToolContext,
 } from "./memory/api.ts"
 import { buildMemoryBlock as buildSurfaceBlock } from "./memory/surface.ts"
+import { runConsolidation, runDreamOrganization } from "./dream/dream.ts"
+import { createOpenAICompatibleModel, dreamProviderConfig, type DreamModel } from "./dream/provider.ts"
+import { vaultPaths } from "./vault/paths.ts"
 
 // V1 invokes server() once per plugin location. Keep all runtime state and
 // storage bindings inside that instance so project options cannot bleed into
 // another location served by the same process.
 function createLegacyPlugin(CONFIG: MemoryConfig) {
 const io = createStore(CONFIG.dir)
-const { getState, getStore, saveState, withLock, writeStore } = io
+const { getState, getStore } = io
 const rerankCache = new Map<string, { at: number; order: string[]; abstain?: boolean }>()
 
 // ---------------------------------------------------------------------------
@@ -93,13 +89,19 @@ function log(
 let consolidationIDs = new Set<string>()
 let queue: string[] = []
 let processing = false
+let pumpTask: Promise<void> | undefined
 let clientRef: any = undefined
 const debounces = new Map<string, ReturnType<typeof setTimeout>>()
 
 function enqueue(sessionID: string) {
   if (queue.includes(sessionID)) return
   queue.push(sessionID)
-  void pump()
+  void startPump()
+}
+
+function startPump(): Promise<void> {
+  if (!pumpTask) pumpTask = pump().finally(() => { pumpTask = undefined })
+  return pumpTask
 }
 
 async function waitForReply(
@@ -126,55 +128,108 @@ async function waitForReply(
   return ""
 }
 
-// Second-pass semantic dedup: the consolidation model may fail to follow the
-// "no duplicate of an explicit entry" rule (weak models, cross-language). We
-// ask a focused question in the SAME headless session and only add candidates
-// that are NOT reported as duplicates.
-//
-// Trust boundaries: the entry list shown here is restricted to the
-// consolidating project's visible entries (consolidationEntries), so neither
-// other projects' memories nor local-only facts leak into this prompt.
-async function dedupCheck(
-  client: any,
-  consSessionID: string,
-  entries: Entry[],
-  candidates: { text: string }[],
-): Promise<Set<number>> {
-  const skip = new Set<number>()
-  if (candidates.length === 0 || entries.length === 0) return skip
-  const entryLines = entries
-    .map((e) => `${e.id} | ${e.source} | ${e.category} | ${e.text}`)
-    .join("\n")
-  const candidateLines = candidates.map((c, i) => `[${i}] ${c.text}`).join("\n")
-  const prompt = `You are a deduplication checker for a memory store.
-
-EXISTING MEMORY ENTRIES:
-${entryLines}
-
-CANDIDATE NEW FACTS:
-${candidateLines}
-
-For each candidate that is semantically equivalent to an existing entry (same meaning, ANY language, paraphrase — e.g. "the user likes green" == "L'utente preferisce il verde"), reply with that candidate's index in "duplicates". An entry with source=explicit always wins over a candidate. Candidates that describe something NEW are not duplicates.
-
-REPLY WITH STRICT JSON ONLY:
-{"duplicates":[0,2]}`
-  try {
-    await client.session.promptAsync({
-      path: { id: consSessionID },
-      body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
-    })
-    const answer = await waitForReply(client, consSessionID, 90_000, { after: Date.now() })
-    const parsed = extractJson(answer)
-    const dups = Array.isArray(parsed?.duplicates) ? parsed.duplicates : []
-    for (const d of dups) {
-      const idx = Number(d)
-      if (Number.isInteger(idx) && idx >= 0 && idx < candidates.length) skip.add(idx)
-    }
-    log("debug", "dedup check", { candidates: candidates.length, duplicates: skip.size })
-  } catch (err) {
-    log("debug", "dedup check failed", { error: String(err) })
+// The Dream model: each adapter wraps its own runtime behind the injectable
+// DreamModel interface. V1 drives a HEADLESS child session (parentID set —
+// invisible in the session picker): create → promptAsync with
+// SESSION_TOOLS_DENY_ALL (zero tools for untrusted text) → waitForReply.
+// The SAME child serves every complete() of one consolidation (consolidation
+// prompt + dedup question, like the historical flow); the adapter deletes it
+// only AFTER runConsolidation has settled, so a completed child delete means
+// the store is already committed.
+function consolidationModel(parentID: string): { model: DreamModel; dispose: () => Promise<void> } {
+  let childID: string | undefined
+  return {
+    model: {
+      async complete({ prompt, timeoutMs }) {
+        if (!childID) {
+          const created = await clientRef.session.create({
+            body: { title: CONSOLIDATION_TITLE, parentID },
+          })
+          childID = created?.data?.id
+          if (!childID) throw new Error("failed to create consolidation session")
+          consolidationIDs.add(childID)
+        }
+        await clientRef.session.promptAsync({
+          path: { id: childID },
+          body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
+        })
+        const answer = await waitForReply(clientRef, childID, timeoutMs ?? 120_000, { after: Date.now() })
+        if (!answer) throw new Error("consolidation timed out")
+        return answer
+      },
+    },
+    dispose: async () => {
+      if (!childID) return
+      const id = childID
+      childID = undefined
+      consolidationIDs.delete(id)
+      await clientRef.session.delete({ path: { id } }).catch(() => {})
+    },
   }
-  return skip
+}
+
+// Self-contained helper model for the organization's enrichment: one throwaway
+// child per complete(), deleted right after the answer (nothing pins the
+// timing of helper children relative to a commit).
+function helperSessionModel(parentID: string): DreamModel {
+  return {
+    async complete({ prompt, timeoutMs }) {
+      const created = await clientRef.session.create({
+        body: { title: CONSOLIDATION_TITLE, parentID },
+      })
+      const childID = created?.data?.id
+      if (!childID) throw new Error("failed to create consolidation session")
+      consolidationIDs.add(childID)
+      try {
+        await clientRef.session.promptAsync({
+          path: { id: childID },
+          body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
+        })
+        const answer = await waitForReply(clientRef, childID, timeoutMs ?? 120_000, { after: Date.now() })
+        if (!answer) throw new Error("consolidation timed out")
+        return answer
+      } finally {
+        consolidationIDs.delete(childID)
+        await clientRef.session.delete({ path: { id: childID } }).catch(() => {})
+      }
+    },
+  }
+}
+
+// Provider dispatch (T9 contract): "openai-compatible" calls the configured
+// chat/completions endpoint directly; "opencode" keeps the adapter's native
+// path. A misconfigured provider yields no model — the caller skips the round
+// and memory stays fully usable.
+function buildDreamModel(parentID?: string): DreamModel | undefined {
+  if (CONFIG.dreamProvider === "openai-compatible") {
+    try {
+      const provider = dreamProviderConfig(CONFIG)
+      if (provider.kind !== "openai-compatible") return undefined
+      return createOpenAICompatibleModel(provider)
+    } catch (err) {
+      log("warn", "dream model unavailable", { error: String(err) })
+      return undefined
+    }
+  }
+  return parentID ? helperSessionModel(parentID) : undefined
+}
+
+// Organization phase (duplicates, knowledge sync, enrichment, staleness
+// proposals) — fired after a committed consolidation and after a sweep. All
+// failures are logged and never break the consolidation round.
+async function dreamOrganization(parentID?: string): Promise<void> {
+  try {
+    const model = buildDreamModel(parentID)
+    const report = await runDreamOrganization(io, CONFIG, vaultPaths(CONFIG.dir), model, log)
+    log("info", "dream organization", {
+      duplicatesArchived: report.duplicatesArchived,
+      staleProposed: report.staleProposed,
+      knowledgeUpdated: report.knowledgeUpdated.length,
+      enriched: report.enriched,
+    })
+  } catch (err) {
+    log("warn", "dream organization failed", { error: String(err) })
+  }
 }
 
 async function pump() {
@@ -221,8 +276,6 @@ async function consolidate(sessionID: string): Promise<void> {
     return
   }
 
-  const state = await getState()
-  log("debug", "state loaded", { sessionID, marked: state.sessions[sessionID] ?? 0 })
   const messagesRes = await clientRef.session.messages({ path: { id: sessionID }, query: { limit: 120 } })
   log("debug", "messages loaded", { sessionID, count: messagesRes?.data?.length ?? -1 })
   const messages: any[] = messagesRes?.data ?? []
@@ -240,22 +293,6 @@ async function consolidate(sessionID: string): Promise<void> {
     (max: number, m: any) => Math.max(max, m?.info?.time?.completed ?? m?.info?.time?.created ?? 0),
     0,
   )
-  log("debug", "lastTs computed", { sessionID, lastTs, marked: state.sessions[sessionID] ?? 0 })
-  if (lastTs <= (state.sessions[sessionID] ?? 0)) return
-
-  // Two-phase guard: if a consolidation for this session is already in
-  // progress (and not stale), skip. A stale inProgress means the previous
-  // process died mid-consolidation: recover and retry — the orphan child is
-  // removed later by gcConsolidationChildren().
-  const ip = state.inProgress?.[sessionID]
-  if (ip) {
-    if (now() - ip.startedAt < CONFIG.inProgressTimeoutMs) {
-      log("debug", "consolidation skipped: already in progress", { sessionID })
-      return
-    }
-    log("debug", "recovering stale inProgress", { sessionID, startedAt: ip.startedAt, childID: ip.childID })
-  }
-
   const transcript = messages
     .map((m: any) => {
       const role = m?.info?.role ?? "unknown"
@@ -266,130 +303,29 @@ async function consolidate(sessionID: string): Promise<void> {
     })
     .join("\n\n")
     .slice(-CONFIG.transcriptChars)
-
   const messageIDs = messages
     .filter((m: any) => m?.id || m?.info?.id)
     .map((m: any) => String(m?.id ?? m?.info?.id))
     .slice(-20)
 
-  const store = await getStore()
-  // The DREAM pipeline sees exactly what its project allows: global entries
-  // plus this session's own project, never local-only facts. The same list
-  // feeds both the prompt and the dedup pass below. The transcript itself is
-  // still processed by the provider configured in OpenCode (documented).
-  const visible = consolidationEntries(store, session.directory)
-  const entriesBlock =
-    visible.length === 0
-      ? "(none)"
-      : visible
-          .map((e) => `- [${e.id}] (${e.scope}/${e.category}, w=${e.weight.toFixed(1)}, source=${e.source}) ${e.text}`)
-          .join("\n")
-
-  const prompt = `You are the memory consolidation module of opencode. You silently read a finished conversation and update the long-term memory store.
-
-TASKS:
-1. new: facts about the user (preferences, constraints, personal details, decisions, project state) that are NOT already in memory. Be concise, third person ("The user...").
-2. update: only entries whose fact genuinely CHANGED in the conversation (e.g. "The user changed jobs" replaces the old one). Never use update for mere reformulation.
-3. delete: ids of entries that are outdated or contradicted.
-4. conflicts: if the conversation STRONGLY contradicts an entry tagged source=explicit (the user says something that invalidates it, e.g. "I always use npm" vs "from now on I use Bun everywhere"), report it here with the entry id and a short evidence quote. Never modify or delete that entry — reporting is enough; the user resolves the conflict.
-${CONFIG.summary ? "5. summary: 2-5 sentence summary of who the user is and how they like to work. NEVER include sensitive data (credentials, tokens, passwords) in the summary." : ""}
-
-SOURCE HIERARCHY (critical):
-- Entries tagged source=explicit were stated directly by the user and ALWAYS win over source=dreamed (inferred) ones.
-- NEVER add a "new" fact that is semantically equivalent to an explicit entry. Equivalence is BROAD: same meaning in ANY language, different wording, or paraphrase — e.g. "The user likes green" == "L'utente preferisce il verde", "the user codes in Rust" == "all'utente piace programmare in Rust", "the user prefers Rust" == "the user uses Rust".
-- ANY fact about the same user attribute/topic as an existing entry (same preference, skill, habit, constraint, decision) is a DUPLICATE, regardless of wording or language. Only add a new fact when it describes a DIFFERENT attribute.
-- NEVER delete or update explicit entries, even when the conversation contradicts them: use the "conflicts" task instead.
-- If a "new" fact duplicates a DREAMED entry, put the old dreamed entry's id in "delete" and the better formulation in "new" — exactly one entry survives.
-- If a dreamed entry contradicts an explicit one, put the dreamed entry's id in "delete".
-
-RULES:
-- Do NOT invent facts; extract only what the conversation actually says.
-- Skip trivial small talk and one-off actions.
-- If nothing new, return empty arrays${CONFIG.summary ? ' but still a summary ("" if no change)' : ''}.
-- Write facts in the same language the user used in the conversation.
-- Existing entries may be written in a DIFFERENT language: compare MEANING, not wording. Before adding a fact, ask yourself "does any existing entry already state this?" — if yes, it is a duplicate.
-- scope "project" ONLY for facts tied to this specific codebase; everything else "global".
-- Optionally attach "confidence" (0-1) to each new fact: how sure the conversation supports it.
-
-RESPOND WITH STRICT JSON ONLY. No markdown fences, no commentary, nothing before or after:
-{"new":[{"text":"...","category":"user|project|workflow|preferences|decisions|status|environment|other","scope":"global|project","confidence":0.9}],"update":[{"id":"...","text":"..."}],"delete":["..."],"conflicts":[{"id":"...","evidence":"..."}]${CONFIG.summary ? ',"summary":"..."' : ''}}
-
-CURRENT MEMORY ENTRIES:
-${entriesBlock}
-
-TRANSCRIPT (session title: ${session.title}):
-${transcript}`
-
-  // Phase 1 of the two-phase commit: record the intent, but do NOT advance
-  // lastCompletedTs yet. lastCompletedTs is only committed after the store
-  // has actually been updated (phase 2, inside the try). This gives
-  // at-least-once semantics without duplicates: a crash after this point
-  // leaves a stale inProgress that the next sweep recovers and retries.
-  state.inProgress![sessionID] = { targetTs: lastTs, startedAt: now() }
-  await saveState(state)
-
-  let consSessionID: string | undefined
+  const dream = consolidationModel(sessionID)
   try {
-    const created = await clientRef.session.create({
-      body: { title: CONSOLIDATION_TITLE, parentID: sessionID },
-    })
-    consSessionID = created?.data?.id
-    if (!consSessionID) throw new Error("failed to create consolidation session")
-    consolidationIDs.add(consSessionID)
-    // Record the child id so a crashed run can be linked to its orphan.
-    state.inProgress![sessionID].childID = consSessionID
-    await saveState(state)
-
-    // SESSION_TOOLS_DENY_ALL: the child processes untrusted conversation
-    // text with ZERO tools (shell, filesystem, network, MCP, subagents,
-    // memory tools — everything). See src/config.ts for the verified
-    // server-side contract.
-    await clientRef.session.promptAsync({
-      path: { id: consSessionID },
-      body: { parts: [{ type: "text", text: prompt }], tools: SESSION_TOOLS_DENY_ALL },
-    })
-    const answer = await waitForReply(clientRef, consSessionID, 120_000, { after: Date.now() })
-    if (!answer) throw new Error("consolidation timed out")
-    const parsed = extractJson(answer)
-    if (!parsed || !Array.isArray(parsed.new)) throw new Error("consolidation returned no usable JSON")
-    if (!CONFIG.summary) delete parsed.summary
-
-    if (Array.isArray(parsed.new) && parsed.new.length > 0 && visible.length > 0) {
-      const skip = await dedupCheck(clientRef, consSessionID, visible, parsed.new)
-      if (skip.size > 0) {
-        log("debug", "dedup applied", { skipped: skip.size, texts: parsed.new.filter((_: any, i: number) => skip.has(i)).map((x: any) => x?.text) })
-        parsed.new = parsed.new.filter((_: any, i: number) => !skip.has(i))
-      }
-    }
-
-    await withLock(async () => {
-      // Fresh read inside the lock so applyConsolidation dedups against the
-      // newest on-disk state (another instance may have written meanwhile).
-      const fresh = await getStore()
-      applyConsolidation(fresh, parsed, session.directory, now(), log, {
-        sessionID,
-        messageIDs,
-      })
-      prune(fresh, now(), CONFIG.maxEntries)
-      await writeStore(fresh)
-    })
-
-    // Phase 2: the store is updated, so commit lastCompletedTs. The final
-    // saveState in the finally block persists this along with the inProgress
-    // removal.
-    state.sessions[sessionID] = lastTs
-    log("info", "consolidated session", { sessionID, newFacts: parsed.new?.length ?? 0 })
-  } catch (err) {
-    log("warn", "consolidation error", { sessionID, error: String(err) })
+    // The shared engine owns the two-phase commit (guards, prompt, semantic
+    // dedup, locked apply+prune+writeStore, commit), the secret guard and the
+    // dedup fallbacks. A failed round leaves memory fully usable.
+    const outcome = await runConsolidation(
+      io,
+      CONFIG,
+      dream.model,
+      { id: sessionID, directory: session.directory, title: session.title },
+      { transcript, messageIDs, lastTs },
+      log,
+    )
+    if (outcome === "committed") void dreamOrganization(sessionID)
   } finally {
-    // Remove the inProgress marker (also on failure: the sweep will retry the
-    // session because lastCompletedTs was not advanced).
-    delete state.inProgress![sessionID]
-    await saveState(state).catch(() => {})
-    if (consSessionID) {
-      consolidationIDs.delete(consSessionID)
-      await clientRef.session.delete({ path: { id: consSessionID } }).catch(() => {})
-    }
+    // The helper child is deleted only after the consolidation settled, so
+    // its deletion implies the store (and the session marker) are committed.
+    await dream.dispose()
   }
 }
 
@@ -455,7 +391,19 @@ async function sweep() {
     for (const s of candidates.slice(0, CONFIG.sweepBatch)) {
       enqueue(s.id)
     }
-    if (candidates.length > 0) log("debug", "sweep queued", { count: Math.min(candidates.length, CONFIG.sweepBatch) })
+    if (candidates.length > 0) {
+      log("debug", "sweep queued", { count: Math.min(candidates.length, CONFIG.sweepBatch) })
+      // Organization runs after the queued consolidations settled (never
+      // concurrently with them) and after the sweep itself. Without a parent
+      // session the opencode provider cannot enrich (the openai-compatible
+      // provider still can).
+      try {
+        await startPump()
+      } catch (err) {
+        log("warn", "sweep pump failed", { error: String(err) })
+      }
+      void dreamOrganization()
+    }
   } catch (err) {
     log("warn", "sweep failed", { error: String(err) })
   }
