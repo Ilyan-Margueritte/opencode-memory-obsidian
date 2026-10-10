@@ -12,6 +12,13 @@ import { CATEGORIES, CORE_CATEGORIES, type Entry } from "../core.ts"
 
 export type ParseResult = { entry: Entry } | { error: string }
 
+// Status as it exists in NOTE frontmatter: the Entry lifecycle values plus the
+// vault-only ARCHIVED marker. ARCHIVED never appears on in-memory entries —
+// it only exists on files under Archives/, which are never scanned back into
+// a Store — but parseNote preserves it so writeStore can recognize an
+// archived note and never re-archive it.
+export type NoteStatus = NonNullable<Entry["status"]> | "ARCHIVED"
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -133,8 +140,8 @@ export function parseNote(raw: string, fileName: string): ParseResult {
         ? "core"
         : "archival"
   const rawStatus = unquote(fields.get("status") ?? "")
-  const status: Entry["status"] =
-    rawStatus === "CONFLICTED" || rawStatus === "SUPERSEDED" ? rawStatus : "ACTIVE"
+  const status: NoteStatus =
+    rawStatus === "CONFLICTED" || rawStatus === "SUPERSEDED" || rawStatus === "ARCHIVED" ? rawStatus : "ACTIVE"
   const rawSensitivity = unquote(fields.get("sensitivity") ?? "")
   const sensitivity: Entry["sensitivity"] =
     rawSensitivity === "private" || rawSensitivity === "local-only" ? rawSensitivity : "normal"
@@ -155,7 +162,9 @@ export function parseNote(raw: string, fileName: string): ParseResult {
     lastSeen: date("lastSeen") ?? Date.now(),
     source,
     tier,
-    status,
+    // Single note↔Entry boundary widening: ARCHIVED only ever comes from a
+    // note under Archives/ (never scanned back) — see NoteStatus.
+    status: status as Entry["status"],
     sensitivity,
   }
   const project = unquote(fields.get("project") ?? "")
