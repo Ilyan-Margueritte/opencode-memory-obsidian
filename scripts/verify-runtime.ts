@@ -85,24 +85,26 @@ async function capture(stream: ReadableStream<Uint8Array>) {
 }
 const capturing = Promise.all([capture(child.stdout), capture(child.stderr)])
 const base = `http://127.0.0.1:${port}`
-async function api(path: string, data?: unknown): Promise<any> {
+async function api(path: string, data?: unknown, timeout = 30_000): Promise<any> {
   const url = new URL(path, base)
   url.searchParams.set("directory", project)
   const response = await fetch(url, {
     headers: { Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`, "Content-Type": "application/json", "x-opencode-directory": project },
     ...(data === undefined ? {} : { method: "POST", body: JSON.stringify(data) }),
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(timeout),
   })
   const text = await response.text()
   if (!response.ok) throw new Error(`${path}: ${response.status} ${text.slice(0,1000)}`)
   const value = JSON.parse(text)
   return v2 && value && typeof value === "object" && "data" in value ? value.data : value
 }
-async function until(check: () => unknown | Promise<unknown>, label: string, timeout = 30_000) {
+// Each attempt gets a short fetch timeout so one hung request cannot consume
+// the whole deadline; failures are caught and retried every 100ms below.
+async function until(check: (timeout: number) => unknown | Promise<unknown>, label: string, timeout = 30_000) {
   const end = Date.now() + timeout
   let last: unknown
   while (Date.now() < end) {
-    try { if (await check()) return } catch (error) { last = error }
+    try { if (await check(5_000)) return } catch (error) { last = error }
     if (child.exitCode !== null) throw new Error(`CLI exited (${child.exitCode})`)
     await Bun.sleep(100)
   }
@@ -113,10 +115,12 @@ async function until(check: () => unknown | Promise<unknown>, label: string, tim
 // .memory/backup-<ts>/ on boot, so the root keeps no JSON).
 const store = () => createStore(memory).getStore()
 try {
-  await until(async () => {
-    if (!v2) return (await api("/experimental/tool/ids")).includes("memory_write")
-    return (await api("/api/plugin")).some((plugin: any) => plugin.id === "cioffi.opencode-memory" && plugin.state.status === "active")
-  }, "plugin loaded")
+  // Cold-start bootstrap can take minutes on slow machines; the server binds
+  // long before plugins load, so be patient here but fail fast per attempt.
+  await until(async (timeout) => {
+    if (!v2) return (await api("/experimental/tool/ids", undefined, timeout)).includes("memory_write")
+    return (await api("/api/plugin", undefined, timeout)).some((plugin: any) => plugin.id === "cioffi.opencode-memory" && plugin.state.status === "active")
+  }, "plugin loaded", 180_000)
   // Live migration check: the legacy seed must have moved into the vault on
   // boot — the root keeps no store.json, the vault has notes, and the
   // migrated entries are retrievable through the vault store.
@@ -139,7 +143,7 @@ try {
     })
     await until(() => model.requests.slice(before).some((request) => request.messages?.some((message: any) =>
       message.role === "tool" && JSON.stringify(message).includes(expected))), `${text} tool result`)
-    if (v2) await until(async () => (await api(`${prefix}/context`)).at(-1)?.type === "idle", "session idle")
+    if (v2) await until(async (timeout) => (await api(`${prefix}/context`, undefined, timeout)).at(-1)?.type === "idle", "session idle")
   }
   await sendAndCheck("WRITE_TEST", "Remembered")
   await sendAndCheck("READ_TEST", "coffee in the morning")
