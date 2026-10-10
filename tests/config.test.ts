@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { resolveConfig } from "../src/config.ts"
 
 test("plugin options override environment values and preserve defaults", () => {
@@ -22,7 +22,7 @@ test("plugin options override environment values and preserve defaults", () => {
   expect(config.dream).toBe(false)
   expect(config.surface).toBe(false)
   expect(config.summary).toBe(false)
-  expect(config.dir).toBe("/tmp/memory-from-config")
+  expect(config.dir).toBe(resolve("/tmp/memory-from-config"))
   expect(config.delayMs).toBe(25)
   expect(config.maxFacts).toBe(7)
   expect(config.rerank).toBe(true)
@@ -39,7 +39,7 @@ test("every environment setting can be supplied through plugin options", () => {
     rerankCandidates: 1, rerankTimeoutMs: 1, rerankCacheMs: 0,
     coreSlot: 0, surfaceRefreshMs: 0,
   }
-  expect(resolveConfig(options, {})).toEqual(options)
+  expect(resolveConfig(options, {})).toEqual({ ...options, dir: resolve("/tmp/memory-all-options") })
 })
 
 test("invalid options fail at setup with the offending name", () => {
