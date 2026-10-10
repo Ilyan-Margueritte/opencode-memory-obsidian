@@ -5,6 +5,66 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-10-10
+
+Obsidian vault release: memory storage moves from a single `store.json` to a
+plain-text Markdown vault designed for Obsidian. Existing 1.x directories are
+converted automatically, from a backup, and the rollback is documented and
+scripted.
+
+### Breaking
+
+- **Markdown vault storage replaces `store.json`.** One memory = one note
+  (flat YAML frontmatter + fact body) under `Global/` and
+  `Projects/<project folder>/`, alongside `SUMMARY.md`, derived `Knowledge/`
+  notes, `Dream/reports/` and an `Archives/` folder; `.memory/` keeps the
+  consolidation state, a note parse-cache index, a per-rewrite history and
+  the lockfile. The canonical id lives in the frontmatter (manual renames are
+  preserved), manual note edits are detected instead of clobbered, and
+  unparseable notes are skipped with their error recorded in the index.
+- **Automatic migration with backup.** The first use of a legacy directory
+  copies `store.json` / `state.json` / `SUMMARY.md` into
+  `.memory/backup-<timestamp>/` before converting, then moves the legacy JSON
+  files into that backup; an unreadable or unsupported store aborts before
+  anything is touched. `scripts/migrate-vault.ts --rollback` restores the
+  backup to the root so the previous 1.x release can read it again.
+- **Secrets are refused.** `memory_write` / `memory_update` reject fact text
+  matching credential patterns and Dream-extracted facts are skipped by the
+  same guard, where 1.x stored whatever it was given.
+
+### Added
+
+- **Obsidian vault layer** (`src/vault`): deterministic project folders,
+  tolerant note parsing (unknown keys ignored, ISO/date/epoch timestamps),
+  disk-scan diffing with an mtime+size index cache, atomic writes and a
+  history backup before every rewrite; removed notes are archived to
+  `Archives/` with `status: "ARCHIVED"` instead of deleted.
+- **Knowledge notes**: derived, regenerable views (`decisions.md`,
+  `preferences.md`, one note per project with an `etat` and a `decisions`
+  section) with `[[wiki links]]` to the source memories; generated content
+  stays between `dream:begin/end` markers and manual text outside them is
+  preserved byte-for-byte; unchanged notes are not rewritten.
+- **Dream organization phase** after each committed consolidation and
+  recovery sweep: dreamed-duplicate merging (explicit entries never touched),
+  knowledge sync, optional per-project model synthesis and staleness
+  PROPOSALS in `Dream/reports/<date>.md` — nothing is archived automatically.
+- **Configurable Dream provider**: `dreamProvider` (`opencode` or
+  `openai-compatible`) with `dreamModel`, `dreamBaseUrl` and `dreamApiKey`
+  (bearer token, never logged nor quoted in errors), plus `staleDays` for the
+  staleness threshold; memory stays fully consultable when the model is
+  unavailable.
+- **Secret filter** (`findSecret`): detects sk- API keys, GitHub/Slack/GitLab
+  tokens, AWS access key ids, PEM private key blocks and
+  `password/token/…: value` assignments; refusals and warnings carry the
+  pattern label, never the value.
+- **Migration CLI**: `bun run scripts/migrate-vault.ts` with `--dir`,
+  `--verify` (note count vs entry count) and `--rollback <backup dir>`.
+
+### Fixed
+
+- Config tests resolve the store directory expectations per platform, so the
+  suite no longer assumes POSIX path resolution and passes on Windows.
+
 ## [1.7.2] — 2026-09-30
 
 ### Added

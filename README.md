@@ -13,9 +13,29 @@ WRITE → DREAM → SURFACE lifecycle:
 
 ## Features
 
-- Local JSON storage with file locking, **zero external database**
+- **Obsidian vault storage**: one memory = one Markdown note with flat YAML
+  frontmatter, in a plain vault you can open, search, edit and sync; file
+  locking included, **zero external database**
 - Explicit and inferred memory hierarchy with **auditable provenance**
   (each dreamed fact knows its source session, messages and confidence)
+- **Archiving instead of deletion**: forgotten, superseded and duplicate notes
+  move to `Archives/` with an `ARCHIVED` marker — nothing is ever silently
+  deleted
+- **Secret filter**: `memory_write` / `memory_update` and Dream-extracted
+  facts are screened for credentials (API keys, GitHub/Slack/AWS/GitLab
+  tokens, private key blocks, `password: …` assignments); refusals carry the
+  pattern label, never the value
+- **Knowledge notes**: derived, regenerable Obsidian views (decisions,
+  preferences, per-project state) with `[[wiki links]]` back to the source
+  memory notes
+- **Dream organization phase**: dreamed-duplicate cleanup, knowledge sync,
+  optional per-project model synthesis and staleness PROPOSALS (nothing is
+  archived automatically)
+- **Configurable Dream provider**: the OpenCode session model (default) or
+  any OpenAI-compatible endpoint (local Ollama/Mistral, vLLM, cloud) — memory
+  stays fully consultable without any model
+- **Automatic 1.x migration**: the first use converts a legacy `store.json`
+  into the vault after backing it up; the rollback is documented and scripted
 - **Memory Inspector**: `/memory` stats, conflicts, "why was this surfaced"
 - **Contradiction lifecycle**: CONFLICTED explicit facts are flagged and
   resolved, never silently overwritten
@@ -53,6 +73,85 @@ single policy in `src/core.ts` (`projectVisible`, `readableEntries`,
 - DREAM consolidation for a session in project A can never suppress, merge
   with, rewrite, supersede or flag entries of project B (or local-only
   entries), even if the consolidation output references their ids.
+
+## Storage: the Obsidian vault
+
+Memories are plain Markdown notes inside one Obsidian-style vault located at
+`dir` (default `~/.local/share/opencode/memory`). Everything is
+human-readable and editable in Obsidian; no external database is involved.
+
+```text
+<memory dir>/
+├── SUMMARY.md                     # shared summary (frontmatter + body)
+├── Global/                        # global-scope memories, one note each
+├── Projects/<slug>-<hash8>/       # per-project memories, deterministic folder
+├── Knowledge/                     # DERIVED views (regenerable, see below)
+│   ├── decisions.md
+│   ├── preferences.md
+│   └── projects/<slug>-<hash8>.md
+├── Dream/reports/<YYYY-MM-DD>.md  # staleness proposals, one report per day
+├── Archives/                      # removed/replaced notes (status ARCHIVED)
+└── .memory/
+    ├── state.json                 # consolidation journal (same format as 1.x)
+    ├── index.json                 # note parse cache (mtimeMs + size)
+    ├── history/                   # raw copy of a note before each rewrite
+    ├── backup-<timestamp>/        # pre-migration backup (see Migration)
+    └── .lock                      # cross-process lockfile
+```
+
+### Note format
+
+One memory = one note: flat YAML frontmatter in a fixed key order, then the
+fact text as body. No YAML package is used; strings are double-quoted,
+timestamps are ISO 8601.
+
+```markdown
+---
+id: "e6f10a2b-1111-4321-8765-abcdefabcdef"
+type: "memory"
+category: "preferences"
+scope: "global"
+tier: "core"
+status: "ACTIVE"
+sensitivity: "normal"
+weight: 3
+source: "explicit"
+createdBy: "memory_write"
+created: "2026-10-10T09:00:00.000Z"
+lastSeen: "2026-10-10T09:00:00.000Z"
+---
+
+The user prefers Bun over npm.
+```
+
+Optional keys (`project`, `pinned`, `confidence`, `sourceSession`,
+`sourceMessages`, `extractedAt`, `expiresAt`, the surfacing/feedback
+counters, `related`) appear only when set.
+
+### Invariants
+
+- **The canonical id lives in the frontmatter; the file name never decides.**
+  Renaming a note in Obsidian is safe: updates are written back to the
+  existing file whatever its name, and only brand-new notes receive the
+  canonical `<slugified-text>-<id8>.md` name.
+- **Manual edits are detected, never clobbered.** Every write diffs the store
+  against a fresh disk scan (content equality through normalized parsing);
+  identical notes are left untouched, and a note that does change is backed
+  up under `.memory/history/` before being rewritten atomically (tmp +
+  rename).
+- **Nothing is silently deleted.** A note still on disk but absent from the
+  store is moved to `Archives/` with `status: "ARCHIVED"` and an `archivedAt`
+  timestamp. `Archives/` is never scanned back into the store.
+- **Tolerant parsing.** Obsidian may reformat files: unknown frontmatter keys
+  are ignored, dates are accepted as ISO datetime, ISO date or epoch-ms
+  numbers, unknown categories fall back to `other`, and missing
+  tier/status/sensitivity get the documented defaults. Unparseable notes are
+  recorded (with their error) in `.memory/index.json` and skipped — they
+  never break the store.
+- **Project isolation survives on disk.** Project-scoped notes live under
+  `Projects/<slug-of-basename>-<hash8-of-path>/`; the folder is derived
+  deterministically from the project directory, so the same project always
+  maps to the same folder.
 
 ## Installation
 
@@ -108,6 +207,13 @@ plugin, and the automatic DREAM cycle runs regardless.
 | `memory_why` | Audit a memory: provenance, lifecycle, score breakdown |
 | `memory_inspect` | `stats` \| `recent` \| `conflicts` \| `project` \| `surfaced` |
 | `memory_useful` / `memory_irrelevant` | Feedback on retrieval quality |
+
+Removal is archiving, not deletion: `memory_forget` / `memory_clear` retract
+entries from the store, and the vault layer then moves the orphaned notes to
+`Archives/` with `status: "ARCHIVED"` (the user-visible tool messages are
+unchanged). Conversely, `memory_write` and `memory_update` refuse facts that
+look like credentials — the refusal names the detected pattern, never the
+value.
 
 `memory_write` retains distinct facts even when they share similar wording or
 are submitted together with `Promise.all`. Repeating the same text (ignoring
@@ -191,7 +297,7 @@ with the offending name instead of silently falling back.
 | `dream` | `OPENCODE_MEMORY_DREAM` | true | Automatic conversation consolidation and recovery sweep. |
 | `surface` | `OPENCODE_MEMORY_SURFACE` | true | Automatic memory injection and semantic reranking. |
 | `summary` | `OPENCODE_MEMORY_SUMMARY` | true | Generate and expose the shared summary in automatic context and `memory_read`. |
-| `dir` | `OPENCODE_MEMORY_DIR` | `~/.local/share/opencode/memory` | Store, state and summary directory. |
+| `dir` | `OPENCODE_MEMORY_DIR` | `~/.local/share/opencode/memory` | Vault root — memory notes, Knowledge, Archives, state and summary directory. |
 | `debug` | `OPENCODE_MEMORY_DEBUG` | false | Trace logging. |
 | `delayMs` | `OPENCODE_MEMORY_DELAY_MS` | 90000 | Idle debounce before DREAM. |
 | `maxEntries` | `OPENCODE_MEMORY_MAX_ENTRIES` | 400 | Maximum retained memories. |
@@ -209,6 +315,11 @@ with the offending name instead of silently falling back.
 | `rerankCacheMs` | `OPENCODE_MEMORY_RERANK_CACHE_MS` | 60000 | Rerank cache lifetime. |
 | `coreSlot` | `OPENCODE_MEMORY_CORE_SLOT` | 3 | Core-tier entries injected beyond relevance matches. |
 | `surfaceRefreshMs` | `OPENCODE_MEMORY_SURFACE_REFRESH_MS` | 900000 | Minimum interval between persisted exposure updates. |
+| `dreamProvider` | `OPENCODE_MEMORY_DREAM_PROVIDER` | `opencode` | Model used by DREAM: `opencode` (the session's model) or `openai-compatible` (direct `POST <baseUrl>/chat/completions`). |
+| `dreamModel` | `OPENCODE_MEMORY_DREAM_MODEL` | — | Model name for the `openai-compatible` provider (required with it). |
+| `dreamBaseUrl` | `OPENCODE_MEMORY_DREAM_BASE_URL` | — | Base URL of the OpenAI-compatible endpoint (required with `openai-compatible`). |
+| `dreamApiKey` | `OPENCODE_MEMORY_DREAM_API_KEY` | — | Optional bearer token for that endpoint. Secret: never logged, never quoted in an error. Pass it through the environment variable — never commit a key in a config file. |
+| `staleDays` | `OPENCODE_MEMORY_STALE_DAYS` | 90 | Days without confirmation before a fact becomes an archiving PROPOSITION in the Dream report. |
 
 Use an absolute `dir` path when overriding the store location. Each plugin
 instance uses its own resolved options and store path. Changing `dir` selects a
@@ -220,6 +331,35 @@ semantic reranking even if `OPENCODE_MEMORY_RERANK=1`. Either setting leaves the
 explicit memory tools available. `OPENCODE_MEMORY_OFF=1` disables the entire plugin.
 These switches do not prevent OpenCode itself or explicit tool calls from sending
 conversation content to the configured model provider.
+
+### Dream on a local OpenAI-compatible endpoint
+
+`dreamProvider: "openai-compatible"` calls any `POST <baseUrl>/chat/completions`
+endpoint directly with `fetch` — no vendor SDK, no new dependency. Example for
+a local Ollama serving Mistral:
+
+```jsonc
+{
+  "plugins": [{
+    "package": "@cioffi_ai/opencode-memory",
+    "options": {
+      "dreamProvider": "openai-compatible",
+      "dreamBaseUrl": "http://127.0.0.1:11434/v1",
+      "dreamModel": "mistral",
+      "staleDays": 60
+    }
+  }]
+}
+```
+
+`dreamBaseUrl` and `dreamModel` are required in that mode; `dreamApiKey` is
+optional (a local Ollama needs none) and can be supplied through the
+environment instead: `OPENCODE_MEMORY_DREAM_PROVIDER`,
+`OPENCODE_MEMORY_DREAM_BASE_URL`, `OPENCODE_MEMORY_DREAM_MODEL`,
+`OPENCODE_MEMORY_DREAM_API_KEY`. The API key is resolved by the provider but
+never logged and never included in an error message — failures quote the HTTP
+status only. When the model is unreachable, the DREAM round is skipped and
+every memory tool keeps working.
 
 ### Disable or clear the summary
 
@@ -237,6 +377,59 @@ await tools.memory_clear({ summaryOnly: true })
 
 The summary is shared across projects, so `summaryOnly` cannot be combined with
 `scope`. If `summary` remains enabled, a later DREAM can generate it again.
+
+## Migration from 1.x
+
+Version 2.0 stores memories as Markdown notes instead of a single
+`store.json`. The migration is automatic, idempotent and reversible.
+
+- **When it runs.** On the first store access after upgrading, the plugin
+  converts a legacy directory (root-level `store.json` + `state.json` +
+  `SUMMARY.md`) into the vault layout. It runs once per directory and
+  process; a second run is a no-op, because the root keeps no JSON afterwards.
+- **Safety first.** `store.json` is read and validated BEFORE anything is
+  created: an unreadable or unsupported store aborts with an explicit error
+  and nothing is touched. The conversion itself runs under the vault lockfile,
+  so two processes can never migrate concurrently.
+- **Backup.** `store.json`, `state.json` and `SUMMARY.md` are copied to
+  `<memory dir>/.memory/backup-<timestamp>/` before the conversion; the
+  legacy JSON files are then MOVED into that backup (the root `SUMMARY.md`
+  becomes the new vault summary). Timestamps use dashes instead of colons so
+  the backup name is a valid Windows directory name.
+
+### Migration CLI
+
+The same migration can be run or checked by hand:
+
+```bash
+bun run scripts/migrate-vault.ts                        # migrate the default dir
+bun run scripts/migrate-vault.ts --dir <memory dir>     # migrate a specific dir
+bun run scripts/migrate-vault.ts --dir <memory dir> --verify
+bun run scripts/migrate-vault.ts --rollback <backup dir>
+```
+
+`--dir` defaults to the configured memory directory. `--verify` recounts the
+notes on disk (`Global/` + `Projects/`) and exits non-zero when the count
+does not match the migrated entries (or, on an already-migrated directory,
+the live vault).
+
+### Rollback procedure (back to 1.x)
+
+1. Quit OpenCode so nothing writes to the vault during the rollback.
+2. Locate the backup created during migration:
+   `<memory dir>/.memory/backup-<timestamp>/`.
+3. Restore it to the memory root:
+
+   ```bash
+   bun run scripts/migrate-vault.ts --rollback "<memory dir>/.memory/backup-<timestamp>"
+   ```
+
+   This copies `store.json`, `state.json` and `SUMMARY.md` from the backup
+   back to `<memory dir>`. The vault notes are left untouched.
+4. Downgrade the plugin to the previous 1.x release: the 1.x store reads the
+   restored root `store.json` again. The rollback is itself reversible —
+   re-upgrading re-migrates the restored `store.json` (a fresh backup is made
+   first).
 
 ## Retrieval semantics (v1.6)
 
@@ -311,8 +504,16 @@ problems, which bag-of-embeddings only partially addresses.
 
 ## Privacy
 
-Memory files are always stored locally (JSON + lockfile, no external database,
-no plugin cloud service).
+Memory files are always stored locally (Markdown vault plus the JSON
+state/index and lockfile under `.memory/`; no external database, no plugin
+cloud service).
+
+Since 2.0, fact text that looks like a credential is refused before it can
+reach the vault: `memory_write` / `memory_update` return a refusal naming the
+detected pattern (label only, never the value), and Dream-extracted facts
+matching the same patterns are skipped with a warning. Secrets therefore
+never enter the vault through either path; `local-only` remains the tool for
+sensitive NON-credential facts.
 
 During DREAM consolidation, the conversation transcript is processed by the
 model provider configured in OpenCode. That provider may be local (e.g.
@@ -334,9 +535,10 @@ plugin never includes them in ANY model-visible path:
   `memory_irrelevant` (they are invisible to all of them).
 
 They are therefore inaccessible to the model in every later session; the only
-supported access path is direct file inspection by the human user
-(`store.json` / `SUMMARY.md` in `OPENCODE_MEMORY_DIR`). Use them as a durable
-local record of secrets that must never propagate to new contexts.
+supported access path is direct file inspection by the human user (the notes
+under `Global/` and `Projects/`, and `SUMMARY.md`, in `OPENCODE_MEMORY_DIR`).
+Use them as a durable local record of sensitive facts that must never
+propagate to new contexts.
 
 Two limitations remain, by architecture rather than by omission:
 
@@ -347,6 +549,69 @@ Two limitations remain, by architecture rather than by omission:
 2. The generated summary is derived from the transcript by the provider; the
    DREAM prompt forbids sensitive data in summaries, but the plugin cannot
    technically guarantee what a remote model writes there.
+
+## Dream: provider and organization phase
+
+### Configurable provider
+
+`dreamProvider` chooses how DREAM reaches a model (see
+[Configuration](#configuration)):
+
+- `opencode` (default): the session's model through OpenCode — V2 uses
+  isolated `ctx.generate.text()`, V1 an allow-none headless session.
+- `openai-compatible`: any `POST <baseUrl>/chat/completions` endpoint called
+  with `fetch` — a local Mistral/Ollama, vLLM or a cloud API. No vendor SDK.
+
+Every model failure degrades to a skipped consolidation round without
+touching the store: reads, writes and all memory tools keep working with no
+model at all (`dream: false` removes even the option of model calls).
+
+### Organization phase
+
+After each committed consolidation and after the recovery sweep, an
+organization phase runs over the vault:
+
+1. **Dreamed duplicates.** Pairs of ACTIVE dreamed entries (same scope and
+   project) whose texts clash on topic or reach similarity ≥ 0.8 are merged:
+   the better-scored entry is kept, the other is removed and its note is
+   archived. EXPLICIT entries are never touched.
+2. **Knowledge sync.** The derived Knowledge notes are regenerated (see
+   [Knowledge notes](#knowledge-notes)).
+3. **Enrichment (optional model).** Each project with 3+ readable project
+   facts gets a plain-text model synthesis spliced into the
+   `<!-- dream:begin:synthese -->` section of its project Knowledge note. A
+   failure skips that section only.
+4. **Staleness proposals.** ACTIVE, unpinned, non-core facts untouched for
+   more than `staleDays` days are listed in `Dream/reports/<YYYY-MM-DD>.md`
+   as archiving PROPOSITIONS. Nothing is ever archived automatically: resolve
+   a proposal with `memory_forget` / `memory_update`.
+
+Idempotence: the same-day report is rewritten (never appended to), and
+Knowledge notes whose content did not change are not rewritten at all.
+
+## Knowledge notes
+
+`Knowledge/` holds DERIVED, regenerable views built FROM the memory notes —
+never a second source of truth. The memory notes stay canonical; deleting any
+Knowledge note is always safe, and the next sync regenerates it:
+
+- `Knowledge/decisions.md` — global-scope decisions,
+- `Knowledge/preferences.md` — global-scope preferences,
+- `Knowledge/projects/<project folder>.md` — one note per project with an
+  `etat` section (the project's living state) and a `decisions` section, so
+  every project entry appears exactly once.
+
+Each item links back to its source note with an Obsidian wiki link:
+`[[<memory note stem>]] — text (source, created)`. CONFLICTED entries are
+listed with a "(conflit à résoudre)" mention; SUPERSEDED tombstones and
+local-only facts are never listed; project facts stay in their project note.
+
+Generated content lives exclusively between
+`<!-- dream:begin:<section> -->` and `<!-- dream:end:<section> -->` markers:
+manual text outside the markers is preserved byte-for-byte, the header and
+intro are written at creation only, and missing markers on an edited file are
+re-appended (with a warning) so Dream can always regenerate. The same store
+always produces byte-identical notes.
 
 ## DREAM containment
 
@@ -365,8 +630,8 @@ consolidation semantics remain enabled for V1.
 
 ## Roadmap
 
-- **2.0**: shared / agent-scoped memory, graph memory with entity
-  relationships, encrypted multi-device sync, import/export.
+- Shared / agent-scoped memory, graph memory with entity relationships,
+  encrypted multi-device sync, import/export.
 
 ## Development
 
