@@ -147,7 +147,9 @@ counters, `related`) appear only when set.
   numbers, unknown categories fall back to `other`, and missing
   tier/status/sensitivity get the documented defaults. Unparseable notes are
   recorded (with their error) in `.memory/index.json` and skipped — they
-  never break the store.
+  never break the store. Unknown frontmatter keys added by hand or by an
+  Obsidian plugin are parsed-tolerated but dropped on the next tool-driven
+  rewrite (the previous raw note stays in `.memory/history/`).
 - **Project isolation survives on disk.** Project-scoped notes live under
   `Projects/<slug-of-basename>-<hash8-of-path>/`; the folder is derived
   deterministically from the project directory, so the same project always
@@ -564,7 +566,10 @@ Two limitations remain, by architecture rather than by omission:
 
 Every model failure degrades to a skipped consolidation round without
 touching the store: reads, writes and all memory tools keep working with no
-model at all (`dream: false` removes even the option of model calls).
+model at all (`dream: false` removes even the option of model calls). On V2,
+a handled model failure during consolidation is retried on the next session
+event, not by the periodic recovery sweep (which only re-runs sessions whose
+`inProgress` marker survived).
 
 ### Organization phase
 
@@ -602,8 +607,10 @@ Knowledge note is always safe, and the next sync regenerates it:
   every project entry appears exactly once.
 
 Each item links back to its source note with an Obsidian wiki link:
-`[[<memory note stem>]] — text (source, created)`. CONFLICTED entries are
-listed with a "(conflit à résoudre)" mention; SUPERSEDED tombstones and
+`[[<memory note stem>]] — text (source, created)`. The `[[...]]` targets are
+the canonical filenames of the source notes, so renaming a memory note by
+hand leaves a dangling link until the next regeneration. CONFLICTED entries
+are listed with a "(conflit à résoudre)" mention; SUPERSEDED tombstones and
 local-only facts are never listed; project facts stay in their project note.
 
 Generated content lives exclusively between

@@ -7,10 +7,11 @@
 // OPENCODE_TEST_DISABLE_SUMMARY=1 checks hidden context/tool output and DREAM
 // ignoring unsolicited summary output. Every run exercises parallel writes
 // and clearing the summary without deleting facts.
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs"
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { startMockModel } from "../tests/fixtures/mock-model.ts"
+import { createStore } from "../src/store.ts"
 
 const binary = process.env.OPENCODE_TEST_BIN
 if (!binary) throw new Error("Set OPENCODE_TEST_BIN to an existing CLI binary; this script never downloads a CLI")
@@ -107,12 +108,24 @@ async function until(check: () => unknown | Promise<unknown>, label: string, tim
   }
   throw new Error(`Timed out: ${label}${last ? ` (${last})` : ""}`)
 }
-const store = () => JSON.parse(readFileSync(join(memory, "store.json"), "utf8"))
+// The vault is the store: read through the same createStore API the plugin
+// uses (the legacy store.json seeded above is auto-migrated into
+// .memory/backup-<ts>/ on boot, so the root keeps no JSON).
+const store = () => createStore(memory).getStore()
 try {
   await until(async () => {
     if (!v2) return (await api("/experimental/tool/ids")).includes("memory_write")
     return (await api("/api/plugin")).some((plugin: any) => plugin.id === "cioffi.opencode-memory" && plugin.state.status === "active")
   }, "plugin loaded")
+  // Live migration check: the legacy seed must have moved into the vault on
+  // boot — the root keeps no store.json, the vault has notes, and the
+  // migrated entries are retrievable through the vault store.
+  if (existsSync(join(memory, "store.json"))) throw new Error("legacy store.json still at the root after boot")
+  const migrated = await store()
+  if (migrated.entries.length < 1) throw new Error("vault has no notes after migration")
+  if (migrated.entries.find((entry: any) => entry.id === "legacy")?.text !== "The user lives in Turin.") {
+    throw new Error("legacy seed not retrievable through the vault store")
+  }
   const session = await api(v2 ? "/api/session" : "/session", {
     title: "Memory compatibility test",
     ...(v2 ? { model: { providerID: "memory-test", id: "test" }, permissions: [{ action: "*", resource: "*", effect: "allow" }] } : { permission: [{ permission: "*", pattern: "*", action: "allow" }] }),
@@ -132,14 +145,14 @@ try {
   await sendAndCheck("READ_TEST", "coffee in the morning")
   if (disableAutomatic) {
     await Bun.sleep(500)
-    if (store().entries.some((entry: any) => entry.source === "dreamed")) throw new Error("DREAM wrote while disabled")
+    if ((await store()).entries.some((entry: any) => entry.source === "dreamed")) throw new Error("DREAM wrote while disabled")
   } else {
-    await until(() => store().entries.some((entry: any) => entry.source === "dreamed" && entry.text.includes("teal terminal")), "automatic DREAM", 40_000)
+    await until(async () => (await store()).entries.some((entry: any) => entry.source === "dreamed" && entry.text.includes("teal terminal")), "automatic DREAM", 40_000)
   }
   // Exercise explicit preferences after consolidation: they intentionally
   // overlap the existing DREAM lexical dedup guard's boilerplate words.
   await sendAndCheck("PARALLEL_TEST", "Remembered")
-  const saved = store()
+  const saved = await store()
   for (const fact of ["The user prefers that repositories be useful and non-wordy.", "The user prefers concise responses."]) {
     if (!saved.entries.some((entry: any) => entry.text === fact)) throw new Error(`parallel write lost: ${fact}`)
   }
@@ -163,8 +176,8 @@ try {
   await sendAndCheck("CLEAR_SUMMARY_TEST", "Cleared memory summary")
   // With summary/DREAM enabled, the completion event may regenerate a summary
   // immediately after the clear tool finishes. Disabled runs must stay empty.
-  if ((disableSummary || disableAutomatic) && store().summary !== "") throw new Error("summary-only clear left summary behind")
-  if (JSON.stringify(store().entries.map((entry: any) => entry.id).sort()) !== JSON.stringify(saved.entries.map((entry: any) => entry.id).sort())) {
+  if ((disableSummary || disableAutomatic) && (await store()).summary !== "") throw new Error("summary-only clear left summary behind")
+  if (JSON.stringify((await store()).entries.map((entry: any) => entry.id).sort()) !== JSON.stringify(saved.entries.map((entry: any) => entry.id).sort())) {
     throw new Error("summary-only clear lost facts")
   }
   console.log(`OK V${major}: parallel writes${v2 ? " through Code Mode Promise.all" : " through concurrent tool calls"}, summary-only clear${disableSummary ? ", summary hidden and DREAM summary disabled" : ""}`)
