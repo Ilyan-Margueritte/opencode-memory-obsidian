@@ -231,4 +231,25 @@ describe("createVaultStore", () => {
       expect(read.summary).toBe("The alpha project context.")
     })
   })
+
+  test("two instances on one directory persist concurrently without tmp-name collisions", async () => {
+    await withVault(async (root) => {
+      await createVaultStore(root).writeStore(storeOf([coffee(), bun()]))
+      const a = createVaultStore(root)
+      const b = createVaultStore(root)
+      // Bare getStore() persists the index without the lock, and tmp names
+      // used to come from a PER-INSTANCE counter: two instances on one
+      // directory minted identical names (same pid, same sequence) and the
+      // second rename failed with ENOENT — reproducible in roughly one full
+      // suite run out of three. The counter is module-level now, so every
+      // name stays unique process-wide; the bounded EPERM retry absorbs the
+      // Windows sharing violations these overlapping renames trigger.
+      for (let round = 0; round < 20; round++) {
+        await Promise.all([a.getStore(), b.getStore(), a.writeStore(storeOf([coffee(), bun()]))])
+      }
+      const read = await b.getStore()
+      expect(read.entries.map((e) => e.id).sort()).toEqual([coffee().id, bun().id].sort())
+      expect(read.entries.every((e) => (e.status ?? "ACTIVE") === "ACTIVE")).toBe(true)
+    })
+  })
 })

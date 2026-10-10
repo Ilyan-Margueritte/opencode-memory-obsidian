@@ -104,9 +104,13 @@ function spliceSection(raw: string, section: string, entries: Entry[]): string {
   return `${raw.slice(0, b)}${block}${raw.slice(e + end.length)}`
 }
 
+// Tmp names carry a pid + module-level counter suffix so concurrent writers
+// (two syncs, or another atomic writer on the same note) never share one tmp
+// file — with a bare fixed name the second rename fails with ENOENT.
+const atomicWriteSeq = { n: 0 }
 async function atomicWrite(file: string, content: string) {
   await mkdir(path.dirname(file), { recursive: true }).catch(() => {})
-  const tmp = `${file}.tmp`
+  const tmp = `${file}.${process.pid}.${++atomicWriteSeq.n}.tmp`
   await writeFile(tmp, content, "utf8")
   await rename(tmp, file)
 }

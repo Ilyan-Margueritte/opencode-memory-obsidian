@@ -28,6 +28,7 @@
 //       archiving PROPOSITIONS — nothing is ever archived automatically,
 //       and the same-day report is rewritten (idempotent).
 
+import { existsSync } from "fs"
 import { mkdir, readFile, rename, writeFile } from "fs/promises"
 import path from "path"
 import {
@@ -67,6 +68,10 @@ export type OrganizationReport = {
 
 function now() {
   return Date.now()
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
 }
 
 // ---------------------------------------------------------------------------
@@ -205,14 +210,26 @@ export async function runConsolidation(
 // Organization phase
 // ---------------------------------------------------------------------------
 
+// Tmp names carry a pid + module-level counter suffix: concurrent writers
+// (two plugin instances, the knowledge sync, a vault write) must never share
+// one tmp file, or the second rename fails with ENOENT. The bounded retry is
+// the same contract as vaultStore's atomicWrite: a concurrent reader holding
+// the destination (Windows sharing violation) surfaces as EPERM and is
+// retried briefly before giving up.
+const atomicWriteSeq = { n: 0 }
 async function atomicWrite(file: string, content: string) {
   await mkdir(path.dirname(file), { recursive: true }).catch(() => {})
-  const tmp = `${file}.tmp`
+  const tmp = `${file}.${process.pid}.${++atomicWriteSeq.n}.tmp`
   await writeFile(tmp, content, "utf8")
-  await rename(tmp, file).catch(async () => {
-    // Windows: a concurrent reader can hold the destination open briefly.
-    await rename(tmp, file)
-  })
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(tmp, file)
+      return
+    } catch (error) {
+      if (attempt >= 19 || !existsSync(tmp)) throw error
+      await sleep(25)
+    }
+  }
 }
 
 // Splice one dream-marked section into a note, preserving every byte outside

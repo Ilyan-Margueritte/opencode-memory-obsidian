@@ -76,6 +76,24 @@ type DiskNote = { file: DiskFile; entry: Entry }
 // src/store.ts.)
 const lockQueues = new Map<string, Promise<void>>()
 
+// Process-wide tmp-name sequence shared by every VaultIO instance: tmp file
+// names must be unique across instances, not just within one (see
+// atomicWrite below).
+const tmpSeqCounter = { n: 0 }
+
+// Stable JSON stringify: object keys sorted recursively and undefined-valued
+// keys dropped, so two index maps built in different scan orders (or one
+// freshly parsed, the other round-tripped through JSON) still compare equal.
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>
+    const keys = Object.keys(record).filter((k) => record[k] !== undefined).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(record[k])}`).join(",")}}`
+  }
+  return JSON.stringify(value) ?? "null"
+}
+
 export function createVaultStore(dataDir: string): VaultIO {
   const paths = vaultPaths(dataDir)
 
@@ -112,10 +130,13 @@ export function createVaultStore(dataDir: string): VaultIO {
   // Unique tmp name: bare getStore() persists the index without taking the
   // lock, so concurrent readers/writers must never share one tmp file (two
   // writers on the same fixed name made the second rename fail with ENOENT).
-  let tmpSeq = 0
+  // The counter lives at module level: two createVaultStore instances on one
+  // directory in the same process would otherwise mint IDENTICAL names
+  // (same pid, same per-instance sequence number) and the second rename
+  // would fail with ENOENT.
   async function atomicWrite(file: string, content: string) {
     await mkdir(path.dirname(file), { recursive: true }).catch(() => {})
-    const tmp = `${file}.${process.pid}.${++tmpSeq}.tmp`
+    const tmp = `${file}.${process.pid}.${++tmpSeqCounter.n}.tmp`
     await writeFile(tmp, content, "utf8")
     // Windows: the destination can be momentarily held open by a concurrent
     // reader (bare getStore re-reads index.json/state.json), which surfaces
@@ -187,7 +208,13 @@ export function createVaultStore(dataDir: string): VaultIO {
   // Fresh recursive scan with index-cached entries reused for unchanged files
   // (same mtimeMs + size). Returns the id→note map and the updated index;
   // files that disappeared are simply absent, so persisting purges them.
-  async function rescan(): Promise<{ notes: Map<string, DiskNote>; index: Record<string, IndexedFile> }> {
+  // The loaded index is returned too, so getStore can skip the rewrite when
+  // the scan changed nothing.
+  async function rescan(): Promise<{
+    notes: Map<string, DiskNote>
+    index: Record<string, IndexedFile>
+    cached: VaultIndex
+  }> {
     const disk = await scanVault()
     const cached = await loadIndex()
     const index: Record<string, IndexedFile> = {}
@@ -209,7 +236,7 @@ export function createVaultStore(dataDir: string): VaultIO {
       index[file.rel] = { id: parsed.entry.id, mtimeMs: file.mtimeMs, size: file.size, entry: parsed.entry }
       notes.set(parsed.entry.id, { file, entry: parsed.entry })
     }
-    return { notes, index }
+    return { notes, index, cached }
   }
 
   // ------------------------------------------------------------------
@@ -227,8 +254,11 @@ export function createVaultStore(dataDir: string): VaultIO {
   }
 
   async function getStore(): Promise<Store> {
-    const { notes, index } = await rescan()
-    await persistIndex(index)
+    const { notes, index, cached } = await rescan()
+    // SURFACE reads run getStore constantly; rewriting the index would mint a
+    // tmp file + rename on every read. Persist only when the fresh scan
+    // differs from the loaded cache (deep equality through stable JSON).
+    if (stableStringify(index) !== stableStringify(cached.files)) await persistIndex(index)
     const entries = [...notes.values()].map((n) => n.entry)
     const raw = await readFile(paths.summary, "utf8").catch(() => undefined)
     const summary = raw === undefined ? "" : summaryBody(raw)
