@@ -198,6 +198,19 @@ curl -o ~/.config/opencode/commands/memory.md \
 The plugin works without `/memory`: the tools are registered directly by the
 plugin, and the automatic DREAM cycle runs regardless.
 
+### Proactive memory use (built in)
+
+You do not have to ask the agent to use its memory. Every surfacing round
+injects a `<memory-tools>` policy next to the `<memory>` facts block, telling
+the model — in the same system context — to save durable facts with
+`memory_write` as they come up (preferences, decisions, project tooling,
+corrections), to consult `memory_read` when past context would help, and to
+correct stored facts with `memory_update`. On OpenCode V2 the memory tools
+live in the Code Mode tools catalog rather than the model's direct tool list;
+the injected policy is what makes proactive use the default behavior. The hint
+is always present (even on an empty vault, before the first memory exists) and
+is never truncated away by the `maxChars` budget.
+
 ## Tools
 
 | Tool | Purpose |

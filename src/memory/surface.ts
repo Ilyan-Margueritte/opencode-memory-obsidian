@@ -20,6 +20,24 @@ function now() {
   return Date.now()
 }
 
+// Usage guidance injected with EVERY surfacing round. On the OpenCode V2
+// runtime the memory tools are exposed through the Code Mode tools catalog,
+// so the model never sees them as direct tools and will not reach for them
+// unprompted — without this static policy, proactive memory use only happens
+// when the user explicitly asks. Always appended whole (never truncated by
+// maxChars), even on an empty store: the first session is exactly when the
+// user states facts worth remembering.
+const MEMORY_TOOLS_HINT = [
+  "<memory-tools>",
+  "Persistent memory tools are available in your tools catalog (Code Mode): tools.memory_write, tools.memory_read, tools.memory_update, tools.memory_forget, tools.memory_why, tools.memory_useful, tools.memory_irrelevant, tools.memory_inspect, tools.memory_clear.",
+  "Use them proactively, without waiting to be asked:",
+  "- tools.memory_write the moment the user states a durable fact: preference, decision, project setup or tooling, constraint, correction. Use scope \"project\" for facts tied to the current codebase, \"global\" otherwise. Never store secrets (passwords, API keys, tokens).",
+  "- tools.memory_read when past context would help (user habits, prior decisions, why the code is the way it is).",
+  "- tools.memory_update when the user corrects a stored fact.",
+  "Skip trivial small talk and one-off actions.",
+  "</memory-tools>",
+].join("\n")
+
 // Persist surface EXPOSURE (lastSurfaced/surfacedCount/useCount) at most once
 // per entry per interval. Deliberately does NOT touch lastSeen: automatic
 // exposure is not evidence that a fact is still current, and refreshing
@@ -55,7 +73,6 @@ export async function buildMemoryBlock(deps: {
 }): Promise<string | undefined> {
   const { io, config, sessionID, directory, query, lastSurface } = deps
   const store = await io.getStore()
-  if (store.entries.length === 0 && !(config.summary && store.summary)) return undefined
   const t = now()
   // retrieve() enforces scope isolation (global + this directory only) and
   // excludes local-only entries via excludeSensitivity.
@@ -105,6 +122,7 @@ export async function buildMemoryBlock(deps: {
   }
   lines.push("</memory>")
   let block = lines.join("\n")
-  if (block.length > config.maxChars) block = block.slice(0, config.maxChars - 1) + "…"
-  return block
+  const budget = Math.max(0, config.maxChars - MEMORY_TOOLS_HINT.length - 1)
+  if (block.length > budget) block = block.slice(0, budget - 1) + "…"
+  return block + "\n" + MEMORY_TOOLS_HINT
 }

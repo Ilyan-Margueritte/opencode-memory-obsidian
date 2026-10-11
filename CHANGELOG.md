@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.1] — 2026-10-11
+
+### Added
+
+- `<memory-tools>` usage policy injected with every surfacing round (V1 and
+  V2), telling the model to save durable facts with `memory_write`
+  proactively, consult `memory_read` when past context helps, and correct
+  with `memory_update`. Always present — even on an empty vault — and exempt
+  from the `maxChars` truncation budget. This makes proactive memory use the
+  default behavior instead of something the user has to request: on OpenCode
+  V2 the memory tools live in the Code Mode tools catalog, so without the
+  injected policy the model rarely reached for them.
 ## [Unreleased]
 
 ## [2.0.0] — 2026-10-10

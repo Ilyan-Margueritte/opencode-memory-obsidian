@@ -158,6 +158,34 @@ for (const major of [1, 2] as const) {
       await rm(dir, { recursive: true, force: true })
     }
   })
+  test(`V${major} surfaces the memory-tools usage hint even when the store is empty`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "memory-surface-hint-"))
+    const instance = await harness(major, dir)
+    try {
+      const surfaced = await instance.surface()
+      expect(surfaced).toContain("<memory-tools>")
+      expect(surfaced).toContain("memory_write")
+      expect(surfaced).toContain("proactively")
+    } finally {
+      await instance.dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`V${major} keeps the usage hint after a populated memory block`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "memory-surface-hint-facts-"))
+    const instance = await harness(major, dir)
+    try {
+      await instance.call("memory_write", { fact: "The user drinks coffee.", category: "preferences" })
+      const surfaced = await instance.surface()
+      expect(surfaced).toContain("The user drinks coffee.")
+      expect(surfaced).toContain("<memory-tools>")
+      expect(surfaced.indexOf("</memory-tools>")).toBeGreaterThan(surfaced.indexOf("</memory>"))
+    } finally {
+      await instance.dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 }
 
 for (const summary of [true, false]) {
