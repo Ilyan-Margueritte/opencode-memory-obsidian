@@ -3,6 +3,31 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+## [2.0.2] — 2026-10-12
+
+### Fixed
+
+- **Concurrent OpenCode desktop instances no longer archive each other's
+  memories.** The desktop app runs one plugin instance per project on one
+  shared vault; the whole-store sync with implicit archive-on-drop let any
+  stale snapshot archive every on-disk note it could not see (fresh entries
+  written by other live instances disappeared in batches). `writeStore` is
+  now UPSERT-ONLY — it writes/refreshes the notes present in the passed
+  store and never archives on-disk notes absent from it — and archiving
+  became an explicit `archiveEntries(ids, reason)` API, called only at the
+  real deletion sites: `memory_forget`, `memory_clear`, the prune after
+  `memory_write` / `memory_update` / consolidation commits, and Dream
+  duplicate fusion. Archived notes now record an `archivedReason` next to
+  `archivedAt`.
+- **Exposure-counter churn no longer floods `.memory/history/`.** A rewrite
+  that only moves the surfacing/usage counters (`useCount`, `lastSurfaced`,
+  `surfacedCount`, `lastUsed`, `helpfulCount`, `irrelevantCount`) is refreshed
+  in place with NO history backup; backups are reserved for content changes.
+  (One instance rewriting counters every 10–60 s used to mint ~200 backup
+  files per day.)
+
 ## [2.0.1] — 2026-10-11
 
 ### Added
@@ -15,7 +40,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   default behavior instead of something the user has to request: on OpenCode
   V2 the memory tools live in the Code Mode tools catalog, so without the
   injected policy the model rarely reached for them.
-## [Unreleased]
 
 ## [2.0.0] — 2026-10-10
 

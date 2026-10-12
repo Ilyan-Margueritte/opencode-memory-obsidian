@@ -139,9 +139,20 @@ counters, `related`) appear only when set.
   identical notes are left untouched, and a note that does change is backed
   up under `.memory/history/` before being rewritten atomically (tmp +
   rename).
-- **Nothing is silently deleted.** A note still on disk but absent from the
-  store is moved to `Archives/` with `status: "ARCHIVED"` and an `archivedAt`
-  timestamp. `Archives/` is never scanned back into the store.
+- **Nothing is silently deleted — and nothing is silently archived either.**
+  Entries are archived ONLY by explicit actions: `memory_forget`,
+  `memory_clear`, the prune after a write/update/consolidation commit, and
+  Dream duplicate fusion. An archived note moves to `Archives/` with
+  `status: "ARCHIVED"`, an `archivedAt` timestamp and an `archivedReason`;
+  `Archives/` is never scanned back into the store. Writes are UPSERT-ONLY:
+  with several OpenCode instances sharing one vault (one project each, as in
+  the desktop app), a stale snapshot from another concurrent instance NEVER
+  archives anything it cannot see.
+- **Exposure-counter churn never floods `.memory/history/`.** The surfacing
+  and usage-feedback counters (`useCount`, `lastSurfaced`, `surfacedCount`,
+  `lastUsed`, `helpfulCount`, `irrelevantCount`) are retrieval metadata, not
+  content: a rewrite that only moves them is refreshed in place with NO
+  history backup. Backups are reserved for content changes.
 - **Tolerant parsing.** Obsidian may reformat files: unknown frontmatter keys
   are ignored, dates are accepted as ISO datetime, ISO date or epoch-ms
   numbers, unknown categories fall back to `other`, and missing
@@ -223,12 +234,13 @@ is never truncated away by the `maxChars` budget.
 | `memory_inspect` | `stats` \| `recent` \| `conflicts` \| `project` \| `surfaced` |
 | `memory_useful` / `memory_irrelevant` | Feedback on retrieval quality |
 
-Removal is archiving, not deletion: `memory_forget` / `memory_clear` retract
-entries from the store, and the vault layer then moves the orphaned notes to
-`Archives/` with `status: "ARCHIVED"` (the user-visible tool messages are
-unchanged). Conversely, `memory_write` and `memory_update` refuse facts that
-look like credentials — the refusal names the detected pattern, never the
-value.
+Removal is archiving, not deletion: `memory_forget` / `memory_clear`
+retract entries from the store and then archive the removed notes
+explicitly — each moves to `Archives/` with `status: "ARCHIVED"`, an
+`archivedAt` timestamp and an `archivedReason` (the user-visible tool
+messages are unchanged). Conversely, `memory_write` and `memory_update`
+refuse facts that look like credentials — the refusal names the detected
+pattern, never the value.
 
 `memory_write` retains distinct facts even when they share similar wording or
 are submitted together with `Promise.all`. Repeating the same text (ignoring
