@@ -93,34 +93,104 @@ describe("createVaultStore", () => {
     })
   })
 
-  test("prune/forget drops are archived with status ARCHIVED and excluded", async () => {
+  // 2.0.2: archiving is an EXPLICIT action (io.archiveEntries). writeStore is
+  // upsert-only — the old implicit archive-on-drop let a stale snapshot from
+  // another concurrent instance archive the entries it could not see.
+  test("archiveEntries moves a dropped note to Archives/ with status ARCHIVED + reason", async () => {
     await withVault(async (root) => {
       const io = createVaultStore(root)
       const a = coffee()
       const b = bun()
       await io.writeStore(storeOf([a, b]))
+      // The caller (prune/forget) removed A from its store; writeStore alone
+      // must NOT archive it — the explicit call does.
       await io.writeStore(storeOf([b]))
+      expect(await io.archiveEntries([a.id], "pruned (score decay, superseded or expired)")).toBe(1)
       const paths = vaultPaths(root)
       const archived = readdirSync(paths.archives)
       expect(archived).toHaveLength(1)
       const raw = readFileSync(join(paths.archives, archived[0]), "utf8")
       expect(raw).toContain('status: "ARCHIVED"')
       expect(raw).toContain("archivedAt: ")
+      expect(raw).toContain('archivedReason: "pruned (score decay, superseded or expired)"')
       expect(existsSync(join(paths.global, "the-user-likes-coffee-aaaaaaaa.md"))).toBe(false)
       const read = await io.getStore()
       expect(read.entries.map((e) => e.id)).toEqual([b.id])
     })
   })
 
-  test("archiving is idempotent: no duplicate on a second identical write", async () => {
+  test("archiveEntries is idempotent: a second call for the same id archives nothing", async () => {
     await withVault(async (root) => {
       const io = createVaultStore(root)
       await io.writeStore(storeOf([coffee(), bun()]))
       await io.writeStore(storeOf([bun()]))
-      await io.writeStore(storeOf([bun()]))
+      expect(await io.archiveEntries([coffee().id], "forgotten by user")).toBe(1)
+      expect(await io.archiveEntries([coffee().id], "forgotten by user")).toBe(0)
+      // Missing ids are skipped silently.
+      expect(await io.archiveEntries(["dddddddd-4444-4321-8765-abcdefabcdef"], "forgotten by user")).toBe(0)
       const paths = vaultPaths(root)
       expect(readdirSync(paths.archives)).toHaveLength(1)
       expect(readdirSync(paths.global)).toHaveLength(1)
+    })
+  })
+
+  // THE 2.0.2 regression: the desktop app runs one plugin instance per project
+  // on one vault. A stale whole-store sync archived every on-disk note absent
+  // from the passed snapshot, so instance1's {A,B} write archived instance2's
+  // freshly consolidated C. Writes are upsert-only now: C must survive.
+  test("stale-writer safety: an old snapshot never archives another instance's notes", async () => {
+    await withVault(async (root) => {
+      const a = coffee()
+      const b = bun()
+      const c = entry({
+        id: "cccccccc-3333-4321-8765-abcdefabcdef",
+        text: "Dreamed by instance two while instance one held a stale snapshot.",
+        source: "dreamed",
+      })
+      // Both instances' common ancestor held A and B only.
+      await createVaultStore(root).writeStore(storeOf([a, b]))
+      const stale = createVaultStore(root) // keeps writing its OLD {A,B} snapshot
+      const fresh = createVaultStore(root) // writes everything it sees on disk
+      const paths = vaultPaths(root)
+      for (let round = 0; round < 10; round++) {
+        // Instance two stores a NEW dreamed fact C.
+        const seen = await fresh.getStore()
+        await fresh.writeStore(storeOf([...seen.entries, c]))
+        // Instance one then syncs its STALE {A,B} snapshot. The old logic
+        // archived C right here; upsert-only writes must leave it ACTIVE.
+        await stale.writeStore(storeOf([a, b]))
+        const read = await stale.getStore()
+        expect(read.entries.map((e) => e.id).sort()).toEqual([a.id, b.id, c.id].sort())
+        expect(read.entries.every((e) => (e.status ?? "ACTIVE") === "ACTIVE")).toBe(true)
+        expect(existsSync(paths.archives)).toBe(false)
+      }
+    })
+  })
+
+  // Counter churn (SURFACE bumps exposure counters every few seconds) used to
+  // mint a history backup per write — ~200 files/day in production. Backups
+  // are reserved for CONTENT changes now.
+  test("exposure-counter churn rewrites in place without a history backup", async () => {
+    await withVault(async (root) => {
+      const io = createVaultStore(root)
+      const a = coffee()
+      await io.writeStore(storeOf([a]))
+      const paths = vaultPaths(root)
+      const history = () => (existsSync(paths.history) ? readdirSync(paths.history) : [])
+      expect(history()).toHaveLength(0)
+
+      // Counter-only change (what markSurfaced does): rewrite, no backup.
+      await io.writeStore(
+        storeOf([{ ...a, useCount: 7, surfacedCount: 4, lastSurfaced: 1730000002000, lastUsed: 1730000002000 }]),
+      )
+      expect(history()).toHaveLength(0)
+      expect((await io.getStore()).entries[0]!.useCount).toBe(7)
+
+      // A content change (the text) still backs up exactly once.
+      await io.writeStore(storeOf([{ ...a, useCount: 8, text: "The user prefers tea now." }]))
+      expect(history()).toHaveLength(1)
+      expect(history()[0]).toMatch(/-aaaaaaaa\.md$/)
+      expect(readFileSync(join(paths.history, history()[0]!), "utf8")).toContain("The user likes coffee.")
     })
   })
 

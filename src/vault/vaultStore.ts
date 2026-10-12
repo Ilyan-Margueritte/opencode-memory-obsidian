@@ -3,13 +3,22 @@
 // and file↔entry association always goes through it, so manual renames are
 // preserved and only brand-new notes receive the canonical file name.
 //
-// Every write diffs the store against a fresh disk scan:
-//   - identical content  → no-op (manual edits/enrichments are never clobbered)
-//   - different content  → previous raw backed up under .memory/history,
-//                          then rewritten atomically (tmp + rename) in place
-//   - id absent on disk  → new note named noteFileName(id, text)
-//   - active disk note absent from the store → ARCHIVED (moved to Archives/
-//     with status ARCHIVED + archivedAt), never silently deleted
+// writeStore is UPSERT-ONLY (2.0.2): every write diffs the passed store
+// against a fresh disk scan:
+//   - identical content        → no-op (manual edits/enrichments are never
+//                                clobbered)
+//   - content-signature change → previous raw backed up under
+//                                .memory/history, then rewritten atomically
+//                                (tmp + rename) in place
+//   - counter-only change      → rewritten in place, NO backup (exposure
+//                                counters churn on every surfacing round
+//                                and must never flood the history)
+//   - id absent on disk        → new note named noteFileName(id, text)
+//   - active disk note absent from the passed store → LEFT UNTOUCHED. With N
+//     concurrent instances holding different snapshots, a stale one must
+//     never archive the others' entries. Archiving is an EXPLICIT action:
+//     archiveEntries(ids, reason), called by the deletion sites only
+//     (forget, clear, prune after write/update/consolidation, dream dedup).
 //
 // A JSON index (.memory/index.json, keyed by path relative to the root with
 // mtimeMs + size) caches parsed entries so unchanged files are not re-parsed;
@@ -18,8 +27,9 @@
 //
 // Cross-instance safety uses the same lockfile + local-queue mechanism as
 // src/store.ts, on <root>/.memory/.lock. Like StoreIO, getStore/writeStore do
-// not lock themselves: callers wrap multi-step mutations in withLock.
-// Stdlib only (fs/path); no YAML package.
+// not lock themselves: callers wrap multi-step mutations in withLock — and
+// archiveEntries takes the lock itself, so it must never be called INSIDE
+// another withLock. Stdlib only (fs/path); no YAML package.
 
 import { existsSync } from "fs"
 import { mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "fs/promises"
@@ -43,6 +53,9 @@ export type VaultIO = {
   withLock<T>(fn: () => Promise<T>): Promise<T>
   getStore(): Promise<Store>
   writeStore(store: Store): Promise<void>
+  // Explicit archiving — the ONLY way an active note leaves the vault
+  // (writeStore is upsert-only and never archives on drop).
+  archiveEntries(ids: string[], reason: string): Promise<number>
   getState(): Promise<State>
   saveState(state: State): Promise<void>
 }
@@ -284,6 +297,31 @@ export function createVaultStore(dataDir: string): VaultIO {
     return true
   }
 
+  // Exposure counters (surfacing + usage-feedback bookkeeping) churn on every
+  // retrieval round — SURFACE bumps them every few seconds — so they are
+  // metadata about RETRIEVAL, not content. A rewrite that only moves them is
+  // refreshed in place and never mints a history backup (2.0.2: the backups
+  // were the .memory/history flood — one file per counter bump per note).
+  // Everything else a note serializes IS content.
+  const EXPOSURE_COUNTER_KEYS = new Set([
+    "useCount",
+    "lastSurfaced",
+    "surfacedCount",
+    "lastUsed",
+    "helpfulCount",
+    "irrelevantCount",
+  ])
+
+  function contentSignature(entry: Entry): string {
+    const c = canonical(entry) as unknown as Record<string, unknown>
+    const content: Record<string, unknown> = {}
+    for (const key of Object.keys(c)) {
+      if (EXPOSURE_COUNTER_KEYS.has(key)) continue
+      content[key] = c[key]
+    }
+    return stableStringify(content)
+  }
+
   // Colons are illegal in Windows file names, hence the replacement.
   function backupName(id: string): string {
     return `${new Date().toISOString().replace(/:/g, "-")}-${id.slice(0, 8)}.md`
@@ -306,7 +344,7 @@ export function createVaultStore(dataDir: string): VaultIO {
         : { id: entry.id, mtimeMs: st.mtimeMs, size: st.size, error: parsed.error }
   }
 
-  async function archiveNote(note: DiskNote, index: Record<string, IndexedFile>) {
+  async function archiveNote(note: DiskNote, index: Record<string, IndexedFile>, reason: string) {
     const raw = await readFile(note.file.abs, "utf8").catch(() => undefined)
     if (raw === undefined) {
       delete index[note.file.rel]
@@ -324,10 +362,11 @@ export function createVaultStore(dataDir: string): VaultIO {
     })
     // The status line is swapped at the NOTE level: ARCHIVED is a
     // vault-format marker (see note.ts NoteStatus), not an Entry status, and
-    // the parsed entry always carries a status line to swap.
+    // the parsed entry always carries a status line to swap. The reason (who
+    // archived this and why) is recorded next to the timestamp.
     const archived = renderNote(note.entry).replace(
       /^status: .*$/m,
-      `status: "ARCHIVED"\narchivedAt: "${new Date().toISOString()}"`,
+      `status: "ARCHIVED"\narchivedAt: "${new Date().toISOString()}"\narchivedReason: ${JSON.stringify(reason)}`,
     )
     await atomicWrite(target, archived)
     delete index[note.file.rel]
@@ -344,7 +383,11 @@ export function createVaultStore(dataDir: string): VaultIO {
       const abs = path.join(dir, existing ? path.basename(existing.file.abs) : noteFileName(entry.id, entry.text))
       if (existing) {
         const raw = await readFile(existing.file.abs, "utf8").catch(() => undefined)
-        if (raw !== undefined) await backup(raw, entry.id)
+        // Backup only on a CONTENT change: a rewrite that merely moved the
+        // exposure counters is refreshed in place (no history backup).
+        if (raw !== undefined && contentSignature(existing.entry) !== contentSignature(entry)) {
+          await backup(raw, entry.id)
+        }
         if (path.relative(existing.file.abs, abs) !== "") {
           // A scope change moved the note to another folder: remove the old
           // file so the id never lives in two places.
@@ -354,19 +397,42 @@ export function createVaultStore(dataDir: string): VaultIO {
       }
       await writeNoteFile(entry, abs, index)
     }
-    for (const note of notes.values()) {
-      if (store.entries.some((e) => e.id === note.entry.id)) continue
-      // Widen to string so the vault-format ARCHIVED marker (never part of
-      // Entry's type) can be compared.
-      const diskStatus: string | undefined = note.entry.status
-      if (diskStatus === "ARCHIVED") continue
-      await archiveNote(note, index)
-    }
+    // UPSERT-ONLY: on-disk active notes absent from the passed store are left
+    // untouched. With several instances sharing one vault (one OpenCode
+    // project each), any snapshot can be stale; the old archive-on-drop let a
+    // stale instance archive the other instances' fresh entries. Archiving
+    // now happens exclusively through archiveEntries, at the deletion sites.
     await atomicWrite(
       paths.summary,
       `---\ntype: "summary"\nupdated: "${new Date(store.updatedAt).toISOString()}"\n---\n\n${store.summary}\n`,
     )
     await persistIndex(index)
+  }
+
+  // Explicit archiving — the only path from an ACTIVE note to Archives/.
+  // Takes the lock itself (never call it inside another withLock) and
+  // re-reads fresh from disk, so it archives what is actually on disk now,
+  // not what some caller's snapshot happened to contain. Missing or
+  // already-archived ids are skipped silently; returns how many notes moved.
+  async function archiveEntries(ids: string[], reason: string): Promise<number> {
+    if (ids.length === 0) return 0
+    return withLock(async () => {
+      const { notes, index } = await rescan()
+      const wanted = new Set(ids)
+      let archived = 0
+      for (const note of notes.values()) {
+        if (!wanted.has(note.entry.id)) continue
+        // Widen to string so the vault-format ARCHIVED marker (never part of
+        // Entry's type) can be compared: a manually-moved-back archived note
+        // is never archived twice.
+        const diskStatus: string | undefined = note.entry.status
+        if (diskStatus === "ARCHIVED") continue
+        await archiveNote(note, index, reason)
+        archived++
+      }
+      if (archived > 0) await persistIndex(index)
+      return archived
+    })
   }
 
   async function getState(): Promise<State> {
@@ -380,5 +446,5 @@ export function createVaultStore(dataDir: string): VaultIO {
     await withLock(() => writeJson(paths.state, state))
   }
 
-  return { withLock, getStore, writeStore, getState, saveState }
+  return { withLock, getStore, writeStore, archiveEntries, getState, saveState }
 }

@@ -4,7 +4,8 @@
 // runtime that hosts them.
 //
 // Persistence goes through the VaultIO boundary (io.withLock / getStore /
-// writeStore); the scope & privacy policy stays in core.ts — every read and
+// writeStore / archiveEntries); the scope & privacy policy stays in core.ts —
+// every read and
 // every mutation below operates on readableEntries()/readQuery() output, so
 // project isolation and the local-only exclusion cannot drift between
 // adapters. Secrets are refused on explicit writes/updates (findSecret); the
@@ -28,6 +29,7 @@ import {
 } from "../core.ts"
 import type { MemoryConfig } from "../config.ts"
 import type { VaultIO } from "../vault/vaultStore.ts"
+import { droppedIds, pruneAndArchive } from "./lifecycle.ts"
 import { findSecret } from "./redaction.ts"
 
 export type ToolContext = {
@@ -92,7 +94,7 @@ export async function memoryWrite(
       ? now() + Number(args.ttlHours ?? 24) * 60 * 60 * 1000
       : undefined
   let status = ""
-  await io.withLock(async () => {
+  const { beforePrune, afterPrune } = await io.withLock(async () => {
     const fresh = await io.getStore()
     // Rewrite targeting is scoped: a write can only refresh an entry
     // in the SAME scope (and same project). Cross-scope equivalents
@@ -139,15 +141,23 @@ export async function memoryWrite(
       })
     }
     fresh.updatedAt = now()
+    // prune() reassigns fresh.entries, so the pre-prune array survives by
+    // reference; the diff is exactly what prune dropped. Archive it
+    // explicitly AFTER the lock (archiveEntries takes the lock itself):
+    // writeStore is upsert-only and never archives on drop.
+    const beforePrune = fresh.entries
     prune(fresh, now(), config.maxEntries)
+    const afterPrune = fresh.entries
     await io.writeStore(fresh)
+    return { beforePrune, afterPrune }
   })
+  await pruneAndArchive(io, config, beforePrune, afterPrune)
   return `Remembered (${scope})${status}: ${text}`
 }
 
 export async function memoryUpdate(
   io: VaultIO,
-  _config: MemoryConfig,
+  config: MemoryConfig,
   ctx: ToolContext,
   args: { id?: string; match?: string; fact: string },
 ): Promise<string> {
@@ -157,7 +167,7 @@ export async function memoryUpdate(
   if (secret) return refused(secret)
   let updated = 0
   let resolvedConflict = false
-  await io.withLock(async () => {
+  const { beforePrune, afterPrune } = await io.withLock(async () => {
     const fresh = await io.getStore()
     const visible = readableEntries(fresh, ctx.directory)
     const target = args.id
@@ -178,8 +188,15 @@ export async function memoryUpdate(
       updated = 1
     }
     fresh.updatedAt = now()
+    // Same lifecycle as memory_write: prune drops (score decay, expiry,
+    // SUPERSEDED grace) are archived explicitly after the lock.
+    const beforePrune = fresh.entries
+    prune(fresh, now(), config.maxEntries)
+    const afterPrune = fresh.entries
     await io.writeStore(fresh)
+    return { beforePrune, afterPrune }
   })
+  await pruneAndArchive(io, config, beforePrune, afterPrune)
   return updated ? `Updated: ${fact}${resolvedConflict ? " (conflict resolved)" : ""}` : "No matching entry found."
 }
 
@@ -366,9 +383,9 @@ export async function memoryIrrelevant(
   return ok ? "Noted as irrelevant." : "No memory entry with this id."
 }
 
-// Removal = entry retraction + writeStore: the vault layer moves the orphaned
-// note under Archives/ with status ARCHIVED (nothing is ever silently
-// deleted). The user-visible message is unchanged.
+// Removal = entry retraction + writeStore + EXPLICIT archiveEntries
+// (writeStore is upsert-only: it never archives on drop, so the deletion
+// site says what it removed). The user-visible message is unchanged.
 export async function memoryForget(
   io: VaultIO,
   _config: MemoryConfig,
@@ -376,24 +393,28 @@ export async function memoryForget(
   args: { id?: string; match?: string },
 ): Promise<string> {
   let removed = 0
+  let removedIds: string[] = []
   await io.withLock(async () => {
     const fresh = await io.getStore()
     const forgettable = new Set(readableEntries(fresh, ctx.directory).map((e) => e.id))
-    const before = fresh.entries.length
-    fresh.entries = fresh.entries.filter((e) => {
-      if (!forgettable.has(e.id)) return true
-      if (args.id && e.id === args.id) return false
-      if (args.match) {
-        const m = String(args.match).toLowerCase()
-        if (m.length > 3 && e.text.toLowerCase().includes(m)) return false
+    const match = args.match ? String(args.match).toLowerCase() : ""
+    const kept: Entry[] = []
+    const dropped: Entry[] = []
+    for (const e of fresh.entries) {
+      if (forgettable.has(e.id) && ((args.id && e.id === args.id) || (match.length > 3 && e.text.toLowerCase().includes(match)))) {
+        dropped.push(e)
+        continue
       }
-      return true
-    })
-    removed = before - fresh.entries.length
+      kept.push(e)
+    }
+    fresh.entries = kept
+    removed = dropped.length
+    removedIds = dropped.map((e) => e.id)
     if (removed) fresh.summary = ""
     fresh.updatedAt = now()
     await io.writeStore(fresh)
   })
+  if (removedIds.length) await io.archiveEntries(removedIds, "forgotten by user")
   return removed ? `Forgot ${removed} entr${removed === 1 ? "y" : "ies"}.` : "No matching entry found."
 }
 
@@ -405,24 +426,33 @@ export async function memoryClear(
 ): Promise<string> {
   if (args.summaryOnly && args.scope) return "The summary is shared; omit scope when using summaryOnly."
   let removed = 0
+  let removedIds: string[] = []
+  let reason = "cleared by user (everything)"
   await io.withLock(async () => {
     const fresh = await io.getStore()
-    const before = fresh.entries.length
+    const before = fresh.entries
     if (args.summaryOnly) {
+      // Summary-only: no entry is removed, nothing to archive.
       fresh.summary = ""
     } else if (args.scope === "project") {
+      reason = "cleared by user (scope: project)"
       removed = clearProjectEntries(fresh, ctx.directory)
+      removedIds = droppedIds(before, fresh.entries)
     } else if (args.scope === "global") {
+      reason = "cleared by user (scope: global)"
       fresh.entries = fresh.entries.filter((e) => e.scope !== "global")
-      removed = before - fresh.entries.length
+      removed = before.length - fresh.entries.length
+      removedIds = droppedIds(before, fresh.entries)
     } else {
       fresh.entries = []
-      removed = before
+      removed = before.length
+      removedIds = before.map((e) => e.id)
     }
     if (removed || (!args.scope && !args.summaryOnly)) fresh.summary = ""
     fresh.updatedAt = now()
     await io.writeStore(fresh)
   })
+  if (removedIds.length) await io.archiveEntries(removedIds, reason)
   if (args.summaryOnly) return "Cleared memory summary; retained all facts."
   return removed ? `Cleared ${removed} memory entr${removed === 1 ? "y" : "ies"}.` : "Memory already empty."
 }

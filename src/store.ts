@@ -53,6 +53,10 @@ export function createStore(dataDir: string) {
       await migrateOnce(dataDir)
       await vault.writeStore(store)
     },
+    async archiveEntries(ids: string[], reason: string) {
+      await migrateOnce(dataDir)
+      return vault.archiveEntries(ids, reason)
+    },
     async getState() {
       await migrateOnce(dataDir)
       return vault.getState()

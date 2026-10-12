@@ -4,7 +4,9 @@
 //   src/v1.ts and src/v2.ts: guards (already-committed session, fresh
 //   inProgress marker, stale-marker recovery), the consolidation prompt,
 //   the second-pass semantic dedup, then the locked applyConsolidation +
-//   prune + writeStore commit, and only afterwards the session timestamp.
+//   prune + writeStore commit followed by an explicit pruneAndArchive (the
+//   drops are archived, never left as stale active notes), and only
+//   afterwards the session timestamp.
 //   The model is INJECTED (DreamModel): each adapter wraps its own runtime
 //   (V1: headless child session; V2: ctx.generate.text) or the configured
 //   openai-compatible endpoint. Every model failure degrades to "failed"
@@ -14,8 +16,8 @@
 //   adapters after a committed consolidation and after the recovery sweep:
 //     ① dreamed duplicates: pairs of ACTIVE dreamed entries (same scope and
 //       project) with a topic clash or similarity ≥ 0.8 — the lower-scored
-//       one is removed then writeStore() archives its note. EXPLICIT entries
-//       are never touched.
+//       one is removed then archived EXPLICITLY via io.archiveEntries
+//       (writeStore is upsert-only). EXPLICIT entries are never touched.
 //     ② syncKnowledgeNotes — called WITHOUT holding the vault lock (it does
 //       no locking internally and writes atomically; re-entering the lock
 //       would deadlock, see the T8 contract).
@@ -47,6 +49,7 @@ import {
   type Store,
 } from "../core.ts"
 import type { MemoryConfig } from "../config.ts"
+import { pruneAndArchive } from "../memory/lifecycle.ts"
 import { syncKnowledgeNotes } from "../knowledge/notes.ts"
 import { projectFolderName, type VaultPaths } from "../vault/paths.ts"
 import type { VaultIO } from "../vault/vaultStore.ts"
@@ -178,17 +181,27 @@ export async function runConsolidation(
       }
     }
 
-    await io.withLock(async () => {
+    // The diff base is captured BEFORE applyConsolidation: consolidation may
+    // itself drop entries (model-requested deletes of dreamed facts), and
+    // prune() then drops decayed/expired ones. Both reassign fresh.entries,
+    // so the array references survive untouched; the drops are archived
+    // EXPLICITLY after the lock (archiveEntries takes the lock itself —
+    // writeStore alone never archives).
+    const { beforeCommit, afterCommit } = await io.withLock(async () => {
       // Fresh read inside the lock so applyConsolidation dedups against the
       // newest on-disk state (another instance may have written meanwhile).
       const fresh = await io.getStore()
+      const beforeCommit = fresh.entries
       applyConsolidation(fresh, parsed, session.directory, now(), log, {
         sessionID: session.id,
         messageIDs: input.messageIDs,
       })
       prune(fresh, now(), config.maxEntries)
+      const afterCommit = fresh.entries
       await io.writeStore(fresh)
+      return { beforeCommit, afterCommit }
     })
+    await pruneAndArchive(io, config, beforeCommit, afterCommit)
 
     // Phase 2: the store is updated, so commit the session timestamp.
     state.sessions[session.id] = input.lastTs
@@ -253,14 +266,16 @@ function upsertSection(raw: string, section: string, body: string): string {
 
 // ① Dreamed near-duplicates: both texts say the same thing about the same
 // topic (topic clash or similarity ≥ 0.8) — keep the better-scored entry and
-// remove the other, whose note the vault then archives. Only ACTIVE, dreamed
-// entries are considered, within the same scope and project; explicit entries
-// (user-stated) are never touched, whatever their wording. Returns the store
-// snapshot read under the lock, so the rest of the phase needs NO unlocked
-// store read (concurrent unlocked index persists from different VaultIO
-// instances can collide on Windows — see the T5 concurrency note).
+// remove the other, whose note is then archived EXPLICITLY via
+// io.archiveEntries (writeStore is upsert-only and never archives on drop).
+// Only ACTIVE, dreamed entries are considered, within the same scope and
+// project; explicit entries (user-stated) are never touched, whatever their
+// wording. Returns the store snapshot read under the lock, so the rest of the
+// phase needs NO unlocked store read (concurrent unlocked index persists
+// from different VaultIO instances can collide on Windows — see the T5
+// concurrency note).
 async function removeDreamedDuplicates(io: VaultIO, log: Log): Promise<{ archived: number; store: Store }> {
-  let archived = 0
+  let droppedIds: string[] = []
   const store = await io.withLock(async () => {
     const fresh = await io.getStore()
     const dreamed = fresh.entries.filter(
@@ -296,10 +311,15 @@ async function removeDreamedDuplicates(io: VaultIO, log: Log): Promise<{ archive
       fresh.entries = fresh.entries.filter((e) => !remove.has(e.id))
       fresh.updatedAt = now()
       await io.writeStore(fresh)
-      archived = remove.size
+      droppedIds = [...remove]
     }
     return fresh
   })
+  // The weaker twins were dropped from the store; archive them explicitly —
+  // AFTER the lock, because archiveEntries takes it.
+  const archived = droppedIds.length
+    ? await io.archiveEntries(droppedIds, "duplicate merged by dream organization")
+    : 0
   return { archived, store }
 }
 
