@@ -14,7 +14,9 @@ export function consolidationPrompt(input: {
   return `You are the memory consolidation module of OpenCode. You silently read a finished conversation and update the long-term memory store.
 
 TASKS:
-1. new: facts about the user (preferences, constraints, personal details, decisions, project state) that are NOT already in memory. Be concise, third person ("The user...").
+1. new: DURABLE facts about the user (preferences, constraints, personal details, decisions, project state) that are NOT already in memory and will still be useful in a later session (roughly 30 days from now). Be concise, third person ("The user...").
+   - Do NOT add session logs, progress updates, completed milestones/task reports, transient troubleshooting, plans, or one-off results.
+   - For project work, prefer updating an existing living project-state entry${summary ? " (or the summary)" : ""} instead of adding another dated completion fact. Add a dated release/version fact only when it establishes a durable constraint, decision, dependency, architecture, command, behavior, or limitation.
 2. update: only entries whose fact genuinely CHANGED in the conversation. Never use update for mere reformulation.
 3. delete: ids of entries that are outdated or contradicted.
 4. conflicts: if the conversation STRONGLY contradicts an entry tagged source=explicit, report it with the entry id and a short evidence quote. Never modify or delete that entry.

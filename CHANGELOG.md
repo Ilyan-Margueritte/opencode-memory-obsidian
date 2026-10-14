@@ -1,3 +1,11 @@
+## [2.0.4] — 2026-10-14
+
+### Changed
+
+- DREAM consolidation now requires durable facts: it keeps only facts
+  expected to remain useful in a later session, skips session logs and
+  dated completion reports, and prefers updating the living project-state
+  entry (or summary) over adding another milestone fact.
 # Changelog
 
 All notable changes to this project are documented in this file.

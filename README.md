@@ -610,6 +610,11 @@ event, not by the periodic recovery sweep (which only re-runs sessions whose
 
 ### Organization phase
 
+Dream saves durable knowledge, not a session journal: consolidation keeps only
+facts expected to remain useful in a later session, skips session logs and
+dated completion reports, and prefers updating the living project-state entry
+(or summary) over adding another milestone fact.
+
 After each committed consolidation and after the recovery sweep, an
 organization phase runs over the vault:
 
