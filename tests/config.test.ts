@@ -37,7 +37,7 @@ test("every environment setting can be supplied through plugin options", () => {
     transcriptChars: 1, sweepIntervalMs: 1, sweepStartMs: 0, sweepBatch: 1,
     gcChildAgeMs: 0, inProgressTimeoutMs: 1, rerank: true,
     rerankCandidates: 1, rerankTimeoutMs: 1, rerankCacheMs: 0,
-    coreSlot: 0, surfaceRefreshMs: 0,
+    coreSlot: 0, surfaceRefreshMs: 0, indexLines: 40,
     dreamProvider: "openai-compatible" as const, dreamModel: "dream-model",
     dreamBaseUrl: "http://127.0.0.1:9/v1", dreamApiKey: "dream-key", staleDays: 1,
   }
@@ -52,6 +52,7 @@ test("invalid options fail at setup with the offending name", () => {
   expect(() => resolveConfig({ rerankTimeoutMs: Infinity }, {})).toThrow("rerankTimeoutMs")
   expect(() => resolveConfig({ dir: "" }, {})).toThrow("dir")
   expect(() => resolveConfig({ dir: "relative/path" }, {})).toThrow("absolute")
+  expect(() => resolveConfig({ indexLines: -1 }, {})).toThrow("indexLines")
 })
 
 test("dream provider options keep their defaults and read the environment", () => {

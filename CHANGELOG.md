@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.3] — 2026-10-14
+
+### Added
+
+- `<memory-index>` table of contents injected with every surfacing round
+  (V1 and V2): a compact, score-sorted list of every active, scope-visible
+  memory so the agent can see what exists and fetch details with
+  `memory_read` instead of only ever seeing relevance-matched facts plus
+  the core slot. Local-only and non-active entries are excluded; the index
+  is exempt from the `maxChars` facts budget and capped by the new
+  `indexLines` option (default 25, 0 disables).
 ## [Unreleased]
 
 ## [2.0.2] — 2026-10-12

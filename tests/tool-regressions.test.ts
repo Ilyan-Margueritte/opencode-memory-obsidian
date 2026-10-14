@@ -166,6 +166,7 @@ for (const major of [1, 2] as const) {
       expect(surfaced).toContain("<memory-tools>")
       expect(surfaced).toContain("memory_write")
       expect(surfaced).toContain("proactively")
+      expect(surfaced).not.toContain("\n<memory-index>")
     } finally {
       await instance.dispose()
       await rm(dir, { recursive: true, force: true })
@@ -181,6 +182,60 @@ for (const major of [1, 2] as const) {
       expect(surfaced).toContain("The user drinks coffee.")
       expect(surfaced).toContain("<memory-tools>")
       expect(surfaced.indexOf("</memory-tools>")).toBeGreaterThan(surfaced.indexOf("</memory>"))
+    } finally {
+      await instance.dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`V${major} lists every active memory in the index section`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "memory-surface-index-"))
+    const instance = await harness(major, dir)
+    try {
+      await instance.call("memory_write", { fact: "The user drinks coffee every morning.", category: "preferences" })
+      await instance.call("memory_write", { fact: "Deployments go through the staging pipeline first.", category: "workflow", scope: "project" })
+      await instance.call("memory_write", { fact: "Local-only trivia about the user.", sensitivity: "local-only" })
+      const surfaced = await instance.surface()
+      expect(surfaced).toContain("<memory-index>")
+      expect(surfaced).toContain("The user drinks coffee every morning.")
+      expect(surfaced).toContain("Deployments go through the staging pipeline first.")
+      expect(surfaced).not.toContain("Local-only trivia")
+      expect(surfaced.indexOf("<memory-index>")).toBeGreaterThan(surfaced.indexOf("</memory>"))
+      expect(surfaced.indexOf("<memory-tools>")).toBeGreaterThan(surfaced.indexOf("</memory-index>"))
+    } finally {
+      await instance.dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`V${major} caps the index section with the indexLines option`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "memory-surface-index-cap-"))
+    const instance = await harness(major, dir, { indexLines: 2 })
+    try {
+      await instance.call("memory_write", { fact: "Alpha fact about testing.", category: "project" })
+      await instance.call("memory_write", { fact: "Beta fact about deployments.", category: "workflow" })
+      await instance.call("memory_write", { fact: "Gamma fact about editors.", category: "environment" })
+      const surfaced = await instance.surface()
+      expect(surfaced).toContain("<memory-index>")
+      const indexPart = surfaced.slice(surfaced.indexOf("<memory-index>"), surfaced.indexOf("</memory-index>"))
+      const lines = indexPart.split("\n").filter((l) => l.startsWith("- "))
+      expect(lines.length).toBe(2)
+    } finally {
+      await instance.dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test(`V${major} keeps the index present when maxChars truncates the facts`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "memory-surface-index-budget-"))
+    const instance = await harness(major, dir, { maxChars: 400 })
+    try {
+      await instance.call("memory_write", { fact: "A long fact that fills the facts budget quickly. ".repeat(20).trim(), category: "project" })
+      await instance.call("memory_write", { fact: "A short second fact.", category: "environment" })
+      const surfaced = await instance.surface()
+      expect(surfaced).toContain("<memory-index>")
+      expect(surfaced).toContain("A short second fact.")
+      expect(surfaced).toContain("<memory-tools>")
     } finally {
       await instance.dispose()
       await rm(dir, { recursive: true, force: true })

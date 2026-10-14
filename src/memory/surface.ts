@@ -9,11 +9,13 @@ import {
   applySurfaceFeedback,
   coreSlot,
   passesRelevanceGate,
+  readableEntries,
   retrieve,
   score,
   type RankedMemory,
 } from "../core.ts"
 import type { MemoryConfig } from "../config.ts"
+import type { Store } from "../core.ts"
 import type { VaultIO } from "../vault/vaultStore.ts"
 
 function now() {
@@ -35,8 +37,28 @@ const MEMORY_TOOLS_HINT = [
   "- tools.memory_read when past context would help (user habits, prior decisions, why the code is the way it is).",
   "- tools.memory_update when the user corrects a stored fact.",
   "Skip trivial small talk and one-off actions.",
+  "- The <memory-index> section lists everything currently in memory. Call tools.memory_read (optionally with a query) for the full text of any item before answering questions that touch the user's preferences, decisions or project state.",
   "</memory-tools>",
 ].join("\n")
+
+// Compact table of contents of the vault, injected after the <memory> facts
+// block and exempt from the maxChars truncation budget. Without it the agent
+// only ever sees facts that match its current query plus the core slot — it
+// cannot ask for what it does not know exists. Sorted by score, capped by
+// config.indexLines (0 disables), local-only and non-active entries excluded.
+function memoryIndexSection(store: Store, directory: string | undefined, config: MemoryConfig, t: number): string {
+  if (config.indexLines <= 0) return ""
+  const entries = readableEntries(store, directory)
+    .filter((e) => e.status === "ACTIVE" && (e.expiresAt === undefined || e.expiresAt > t))
+    .sort((a, b) => score(b, t) - score(a, t))
+    .slice(0, config.indexLines)
+  if (entries.length === 0) return ""
+  const lines = entries.map((e) => {
+    const text = e.text.replace(/\s+/g, " ").trim().slice(0, 70)
+    return `- ${text}${e.scope === "project" ? " [project]" : ""}`
+  })
+  return `\n<memory-index>\n${lines.join("\n")}\n</memory-index>`
+}
 
 // Persist surface EXPOSURE (lastSurfaced/surfacedCount/useCount) at most once
 // per entry per interval. Deliberately does NOT touch lastSeen: automatic
@@ -124,5 +146,6 @@ export async function buildMemoryBlock(deps: {
   let block = lines.join("\n")
   const budget = Math.max(0, config.maxChars - MEMORY_TOOLS_HINT.length - 1)
   if (block.length > budget) block = block.slice(0, budget - 1) + "…"
-  return block + "\n" + MEMORY_TOOLS_HINT
+  const index = memoryIndexSection(store, directory, config, t)
+  return block + index + "\n" + MEMORY_TOOLS_HINT
 }

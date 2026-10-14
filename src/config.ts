@@ -38,6 +38,7 @@ const OPTION_ENV = {
   dreamBaseUrl: "OPENCODE_MEMORY_DREAM_BASE_URL",
   dreamApiKey: "OPENCODE_MEMORY_DREAM_API_KEY",
   staleDays: "OPENCODE_MEMORY_STALE_DAYS",
+  indexLines: "OPENCODE_MEMORY_INDEX_LINES",
 } as const
 
 export type MemoryConfig = {
@@ -75,6 +76,10 @@ export type MemoryConfig = {
   dreamApiKey?: string
   // Facts untouched for longer than this many days count as stale candidates.
   staleDays: number
+  // Lines of the <memory-index> section injected with every surfacing round:
+  // a compact table of contents of the vault so the agent sees what exists
+  // and can fetch details with memory_read. 0 disables the section.
+  indexLines: number
 }
 
 export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = process.env): MemoryConfig {
@@ -177,7 +182,9 @@ export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS
     dreamModel,
     dreamBaseUrl,
     dreamApiKey,
+    // Facts untouched for longer than this many days count as stale candidates.
     staleDays: integer("staleDays", 90, 1),
+    indexLines: integer("indexLines", 25, 0),
   }
 }
 

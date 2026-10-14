@@ -222,6 +222,17 @@ the injected policy is what makes proactive use the default behavior. The hint
 is always present (even on an empty vault, before the first memory exists) and
 is never truncated away by the `maxChars` budget.
 
+### The `<memory-index>` table of contents
+
+Relevance matching only surfaces facts tied to the current message — so an
+agent could not ask for a memory it did not know existed. Every prompt
+therefore also carries a `<memory-index>` section: a compact, score-sorted
+table of contents of the whole vault (one line per fact, capped by
+`indexLines`, local-only and non-active entries excluded). The injected
+policy tells the agent to call `memory_read` with a query for details on any
+index line before answering questions that touch past decisions, preferences
+or project state. The index is exempt from the `maxChars` facts budget.
+
 ## Tools
 
 | Tool | Purpose |
@@ -347,6 +358,7 @@ with the offending name instead of silently falling back.
 | `dreamBaseUrl` | `OPENCODE_MEMORY_DREAM_BASE_URL` | — | Base URL of the OpenAI-compatible endpoint (required with `openai-compatible`). |
 | `dreamApiKey` | `OPENCODE_MEMORY_DREAM_API_KEY` | — | Optional bearer token for that endpoint. Secret: never logged, never quoted in an error. Pass it through the environment variable — never commit a key in a config file. |
 | `staleDays` | `OPENCODE_MEMORY_STALE_DAYS` | 90 | Days without confirmation before a fact becomes an archiving PROPOSITION in the Dream report. |
+| `indexLines` | `OPENCODE_MEMORY_INDEX_LINES` | 25 | Lines of the `<memory-index>` table of contents injected with every prompt (0 disables it). |
 
 Use an absolute `dir` path when overriding the store location. Each plugin
 instance uses its own resolved options and store path. Changing `dir` selects a
