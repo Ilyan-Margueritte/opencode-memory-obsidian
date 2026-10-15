@@ -15,6 +15,7 @@ import {
   type ToolContext,
 } from "./memory/api.ts"
 import { buildMemoryBlock as buildSurfaceBlock } from "./memory/surface.ts"
+import { extractRememberCommand } from "./memory/autocapture.ts"
 import { runConsolidation, runDreamOrganization } from "./dream/dream.ts"
 import { createOpenAICompatibleModel, dreamProviderConfig, type DreamModel } from "./dream/provider.ts"
 import { vaultPaths } from "./vault/paths.ts"
@@ -128,6 +129,29 @@ class V2MemoryRuntime {
             if (block) event.system.push({ type: "text", text: block })
           } catch (error) {
             this.log("debug", "context hook failed", { error: String(error) })
+          }
+        }))
+      }
+
+      if (this.config.autocapture) {
+        // Same deterministic capture as V1's chat.message hook (see
+        // src/memory/autocapture.ts): explicit "remember…" commands are
+        // stored without waiting for the model to call memory_write.
+        this.registrations.push(await this.ctx.session.hook("prompt", async (event) => {
+          try {
+            const sessionID = String(event.sessionID)
+            const command = extractRememberCommand(String(event.prompt?.text ?? ""))
+            if (!command) return
+            const directory = await this.directoryFor(sessionID)
+            const result = await memoryWrite(
+              this.store,
+              this.config,
+              this.toolCtx(directory, sessionID),
+              { fact: command.fact, scope: command.project ? "project" : "global" },
+            )
+            this.log("info", "autocaptured explicit memory command", { sessionID, result: result.slice(0, 80) })
+          } catch (error) {
+            this.log("debug", "autocapture error", { error: String(error) })
           }
         }))
       }

@@ -16,6 +16,7 @@ import {
   type ToolContext,
 } from "./memory/api.ts"
 import { buildMemoryBlock as buildSurfaceBlock } from "./memory/surface.ts"
+import { extractRememberCommand } from "./memory/autocapture.ts"
 import { runConsolidation, runDreamOrganization } from "./dream/dream.ts"
 import { createOpenAICompatibleModel, dreamProviderConfig, type DreamModel } from "./dream/provider.ts"
 import { vaultPaths } from "./vault/paths.ts"
@@ -541,6 +542,39 @@ return async ({ client }: { client: any }) => {
         if (block) output.system.push(block)
       } catch (err) {
         log("debug", "system transform error", { error: String(err) })
+      }
+    },
+
+    // Deterministic capture of explicit memory commands ("retiens que…",
+    // "remember that…"). A hook cannot force the model to call memory_write —
+    // and the model often acknowledges without calling it — so the plugin
+    // stores the fact itself, right here, without waiting. memoryWrite
+    // dedups exact repeats, so a model that also calls the tool only
+    // refreshes. Never throws: capture must never break the turn.
+    "chat.message": async (
+      input: { sessionID: string },
+      output: { message: unknown; parts: { type?: string; text?: string }[] },
+    ) => {
+      try {
+        if (!CONFIG.autocapture) return
+        if (!input.sessionID || consolidationIDs.has(input.sessionID)) return
+        const text = (output.parts ?? [])
+          .filter((p) => p?.type === "text" && typeof p.text === "string")
+          .map((p) => p.text as string)
+          .join("\n")
+        const command = extractRememberCommand(text)
+        if (!command) return
+        const session = await sessionInfo(client, input.sessionID)
+        const directory = session?.directory
+        const result = await memoryWrite(
+          io,
+          CONFIG,
+          toolCtx({ directory, sessionID: input.sessionID }),
+          { fact: command.fact, scope: command.project ? "project" : "global" },
+        )
+        log("info", "autocaptured explicit memory command", { sessionID: input.sessionID, result: result.slice(0, 80) })
+      } catch (err) {
+        log("debug", "autocapture error", { error: String(err) })
       }
     },
 

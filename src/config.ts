@@ -39,6 +39,7 @@ const OPTION_ENV = {
   dreamApiKey: "OPENCODE_MEMORY_DREAM_API_KEY",
   staleDays: "OPENCODE_MEMORY_STALE_DAYS",
   indexLines: "OPENCODE_MEMORY_INDEX_LINES",
+  autocapture: "OPENCODE_MEMORY_AUTOCAPTURE",
 } as const
 
 export type MemoryConfig = {
@@ -80,6 +81,9 @@ export type MemoryConfig = {
   // a compact table of contents of the vault so the agent sees what exists
   // and can fetch details with memory_read. 0 disables the section.
   indexLines: number
+  // Deterministic capture of explicit memory commands ("retiens que…",
+  // "remember that…"): the adapters store them without waiting for the model.
+  autocapture: boolean
 }
 
 export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = process.env): MemoryConfig {
@@ -185,6 +189,7 @@ export function resolveConfig(options: Record<string, unknown> = {}, env: NodeJS
     // Facts untouched for longer than this many days count as stale candidates.
     staleDays: integer("staleDays", 90, 1),
     indexLines: integer("indexLines", 25, 0),
+    autocapture: boolean("autocapture", true),
   }
 }
 

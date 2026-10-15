@@ -222,6 +222,21 @@ the injected policy is what makes proactive use the default behavior. The hint
 is always present (even on an empty vault, before the first memory exists) and
 is never truncated away by the `maxChars` budget.
 
+### Deterministic capture of explicit commands
+
+A hook cannot force a model to call a tool — and models often acknowledge a
+"remember this" request without calling `memory_write`. So the plugin does
+not wait: on every incoming user message (`chat.message` on V1,
+`session.prompt` on V2) it matches explicit memory orders in French and
+English ("retiens que…", "souviens-toi que…", "remember that…",
+"note down…", "n'oublie pas que…", …) and stores the fact itself through the
+same `memory_write` path (secret filter, scope inference — "ce projet" /
+"this project" selects the project scope, exact-repeat dedup). Questions
+("tu te souviens… ?", "do you remember…?") and nostalgia ("remember
+when…") never match. Disable it with `autocapture: false`
+(`OPENCODE_MEMORY_AUTOCAPTURE=0`); implicit durable facts still go through
+DREAM judgment.
+
 ### The `<memory-index>` table of contents
 
 Relevance matching only surfaces facts tied to the current message — so an

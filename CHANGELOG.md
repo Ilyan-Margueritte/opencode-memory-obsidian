@@ -1,3 +1,16 @@
+## [2.0.5] — 2026-10-15
+
+### Added
+
+- Deterministic capture of explicit memory commands: on every incoming
+  user message (`chat.message` on V1, `session.prompt` on V2), explicit
+  orders such as “retiens que…”, “souviens-toi que…”, “remember that…” or
+  “note down…” are stored through the regular `memory_write` path (secret
+  filter, project-scope inference, exact-repeat dedup) without waiting
+  for the model to call the tool. Questions and nostalgia never match.
+  Disable with the new `autocapture` option (default true,
+  `OPENCODE_MEMORY_AUTOCAPTURE`). Implicit durable facts still go through
+  DREAM judgment.
 ## [2.0.4] — 2026-10-14
 
 ### Changed

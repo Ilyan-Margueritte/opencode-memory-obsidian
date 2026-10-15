@@ -32,7 +32,7 @@ async function harness(major: 1 | 2, dir: string, options: Record<string, unknow
     }
   }
   const tools = new Map<string, any>()
-  let hook: ((event: any) => Promise<void>) | undefined
+  const hooks = new Map<string, (event: any) => Promise<void>>()
   const dispose = await plugin.setup({
     options: config,
     location: { directory },
@@ -47,7 +47,7 @@ async function harness(major: 1 | 2, dir: string, options: Record<string, unknow
       get: async () => ({ location: { directory } }),
       context: async () => [],
       hook: async (_name: string, callback: any) => {
-        hook = callback
+        hooks.set(_name, callback)
         return { dispose: async () => {} }
       },
     },
@@ -57,7 +57,7 @@ async function harness(major: 1 | 2, dir: string, options: Record<string, unknow
       (await tools.get(name).execute(args, { sessionID: "session" })).content as string,
     surface: async () => {
       const event = { sessionID: "session", system: [] as { text: string }[] }
-      await hook?.(event)
+      await hooks.get("context")?.(event)
       return event.system.map((part) => part.text).join("\n")
     },
     dispose: async () => { await dispose?.() },

@@ -46,7 +46,7 @@ const ctx = {
     hook: async (name, callback) => {
       if (failSetup) throw new Error("simulated hook registration failure")
       hooks[name] = callback
-      return { dispose: async () => { disposed.push("context") } }
+      return { dispose: async () => { disposed.push(name) } }
     },
     get: async ({ sessionID: id }) => ({
       id,
@@ -183,7 +183,7 @@ if (hooks.context) {
 
 await cleanup?.()
 await cleanup?.()
-const expectedDisposed = surfaceDisabled ? '["tools"]' : '["context","tools"]'
+const expectedDisposed = surfaceDisabled ? '["prompt","tools"]' : '["prompt","context","tools"]'
 if (JSON.stringify(disposed) !== expectedDisposed) throw new Error("cleanup must dispose registrations exactly once in reverse order")
 if (foreignReads !== 0) throw new Error("a completion event from another project reached consolidation")
 console.log("V2_CHECK_OK")
