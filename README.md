@@ -237,6 +237,19 @@ when…") never match. Disable it with `autocapture: false`
 (`OPENCODE_MEMORY_AUTOCAPTURE=0`); implicit durable facts still go through
 DREAM judgment.
 
+### The memory agent (`@memory`)
+
+The package bundles a dedicated agent, `agents/memory.md`, installed into
+`<config>/opencode/agents/memory.md` when the plugin loads — create-only:
+if the file already exists (your own customized version), it is never
+overwritten. The agent is a vault librarian: it retrieves, writes,
+corrects, forgets, audits and rates memories through the nine `memory_*`
+tools, and answers in the user's language. `mode: all` makes it usable
+directly (`@memory`) and delegable from other agents. Permissions are
+conservative: read allowed, edit/shell/subagent denied — the memory tools
+come from the Code Mode catalog, not from the shell. Restart OpenCode once
+after adding the plugin; the agent then appears in the `@` menu.
+
 ### The `<memory-index>` table of contents
 
 Relevance matching only surfaces facts tied to the current message — so an

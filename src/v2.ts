@@ -16,6 +16,7 @@ import {
 } from "./memory/api.ts"
 import { buildMemoryBlock as buildSurfaceBlock } from "./memory/surface.ts"
 import { extractRememberCommand } from "./memory/autocapture.ts"
+import { AGENT_FILE, installAgent } from "./agent/install.ts"
 import { runConsolidation, runDreamOrganization } from "./dream/dream.ts"
 import { createOpenAICompatibleModel, dreamProviderConfig, type DreamModel } from "./dream/provider.ts"
 import { vaultPaths } from "./vault/paths.ts"
@@ -115,6 +116,15 @@ class V2MemoryRuntime {
 
     const loaded = await this.store.getStore()
     this.log("info", `memory V2 plugin loaded (${loaded.entries.length} entries, summary ${loaded.summary.length} chars)`)
+
+    // Same agent-file installation as the V1 adapter: a plugin cannot
+    // register an agent in V2, so it installs the FILE itself, create-only.
+    // Failure must never break the plugin load.
+    try {
+      if (installAgent() === "created") this.log("info", `agent ${AGENT_FILE} installed (create-only)`)
+    } catch (error) {
+      this.log("debug", "agent install failed", { error: String(error) })
+    }
 
     try {
       await this.registerTools()

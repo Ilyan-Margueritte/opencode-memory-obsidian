@@ -17,6 +17,7 @@ import {
 } from "./memory/api.ts"
 import { buildMemoryBlock as buildSurfaceBlock } from "./memory/surface.ts"
 import { extractRememberCommand } from "./memory/autocapture.ts"
+import { AGENT_FILE, installAgent } from "./agent/install.ts"
 import { runConsolidation, runDreamOrganization } from "./dream/dream.ts"
 import { createOpenAICompatibleModel, dreamProviderConfig, type DreamModel } from "./dream/provider.ts"
 import { vaultPaths } from "./vault/paths.ts"
@@ -490,6 +491,15 @@ return async ({ client }: { client: any }) => {
 
   const loaded = await getStore()
   log("info", `memory plugin loaded (${loaded.entries.length} entries, summary ${loaded.summary.length} chars)`)
+
+  // L'agent `memory` ne peut pas être enregistré par un plugin : on installe
+  // son FICHIER à la place, create-only (src/agent/install.ts). L'échec ne
+  // doit jamais empêcher le chargement du plugin lui-même.
+  try {
+    if (installAgent() === "created") log("info", `agent ${AGENT_FILE} installed (create-only)`)
+  } catch (err) {
+    log("debug", "agent install failed", { error: String(err) })
+  }
 
   const timer = CONFIG.dream ? setTimeout(() => void sweep(), CONFIG.sweepStartMs) : undefined
   const interval = CONFIG.dream ? setInterval(() => void sweep(), CONFIG.sweepIntervalMs) : undefined

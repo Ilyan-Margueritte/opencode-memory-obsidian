@@ -1,0 +1,5 @@
+# Isolation des tests : pointe l'installation de l'agent vers un dossier
+# temporaire (tests/agents-env.ts) pour ne jamais toucher le vrai
+# ~/.config/opencode pendant les suites de tests.
+[test]
+preload = ["./tests/agents-env.ts"]

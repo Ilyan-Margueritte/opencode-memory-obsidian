@@ -1,3 +1,22 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [Unreleased]
+
+## [2.1.0] — 2026-10-17
+
+### Added
+
+- Bundled `@memory` agent: the plugin installs `agents/memory.md` into
+  `<config>/opencode/agents/` at load time — create-only, an existing file
+  (personalized or hand-authored) is never overwritten. The agent is a vault
+  librarian (retrieval, write/update/forget, inspection, feedback) usable
+  both as a primary agent (`@memory`) and as a delegate from other agents
+  (`mode: all`). Permissions are conservative: read allowed, edit/shell/
+  subagent denied — the memory tools come from the Code Mode catalog.
+
 ## [2.0.5] — 2026-10-15
 
 ### Added
@@ -19,10 +38,6 @@
   expected to remain useful in a later session, skips session logs and
   dated completion reports, and prefers updating the living project-state
   entry (or summary) over adding another milestone fact.
-# Changelog
-
-All notable changes to this project are documented in this file.
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [2.0.3] — 2026-10-14
 
@@ -35,8 +50,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the core slot. Local-only and non-active entries are excluded; the index
   is exempt from the `maxChars` facts budget and capped by the new
   `indexLines` option (default 25, 0 disables).
-## [Unreleased]
-
 ## [2.0.2] — 2026-10-12
 
 ### Fixed
